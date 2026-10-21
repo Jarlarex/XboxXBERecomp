@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 
 #include "kernel/disc.h"
@@ -78,6 +79,10 @@ struct File : Object {
     size_t next = 0;
     bool listed = false;
     bool delete_on_close = false;
+    // what an overwrite on open released: FATX hands the freed clusters back without zeroing them when the file grows
+    // again, and titles rely on it (Forza Motorsport recreates each installed file with CREATE_ALWAYS, then sets its
+    // end of file to the old size and expects the data back)
+    std::vector<uint8_t> released;
     std::mutex io;  // threads sharing a handle: seek and transfer stay together
     File() : Object(ObjType::File) {}
     ~File() override {
@@ -437,6 +442,15 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
         IoStatus(iosb, kObjectPathNotFound, 0);
         return kObjectPathNotFound;
     }
+    std::vector<uint8_t> released;
+    constexpr uint64_t kMaxReleased = 256ull << 20;
+    if (exists && (disposition == 0 || disposition == 4 || disposition == 5)) {
+        uint64_t old_size = fs::file_size(host, ec);
+        if (!ec && old_size <= kMaxReleased) {
+            std::ifstream old_file(host, std::ios::binary);
+            released.assign(std::istreambuf_iterator<char>(old_file), {});
+        }
+    }
     FILE* fp = std::fopen(host.c_str(), mode);
     if (!fp && std::string(mode) == "r+b") fp = std::fopen(host.c_str(), "rb");  // read only media
     if (!fp) {
@@ -449,6 +463,7 @@ KERNEL_EXPORT(190, NtCreateFile, 9) {
     f->xbox = Normalize(name);
     f->fp = fp;
     f->delete_on_close = options & 0x1000;  // FILE_DELETE_ON_CLOSE
+    f->released = std::move(released);
     W32(handle_out, NewHandle(f));
     IoStatus(iosb, kSuccess, info);
     LOG_FIRST(400, "open %s", name.c_str());
@@ -591,7 +606,16 @@ KERNEL_EXPORT(226, NtSetInformationFile, 5) {
                 std::lock_guard<std::mutex> lock(f->io);
                 std::fflush(f->fp);
                 uint64_t size = fs::file_size(f->host, ec);
-                if (cls == 20 || R64(in) < size) fs::resize_file(f->host, R64(in), ec);
+                uint64_t want = R64(in);
+                if (cls == 20 || want < size) fs::resize_file(f->host, want, ec);
+                // growing over what an overwrite released brings those bytes back, as FATX does
+                if (cls == 20 && want > size && size < f->released.size()) {
+                    uint64_t end = std::min<uint64_t>(want, f->released.size());
+                    Seek(f->fp, size);
+                    std::fwrite(f->released.data() + size, 1, size_t(end - size), f->fp);
+                    std::fflush(f->fp);
+                    Seek(f->fp, f->pos);
+                }
             }
             break;
         case 13:  // disposition
