@@ -427,6 +427,7 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
+    void SetOverlay(const Overlay& overlay) override;
     void ClearReport() override { counted_.clear(); }
     // done once the list being recorded, the next fence value, has run
     void GetReport(uint32_t report) override { reports_.push_back({report, counted_, fence_value_ + 1}); }
@@ -568,6 +569,8 @@ private:
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
     void BlitFrame(Target& t);
+    void DrawOverlay(const Target& frame);
+    Tex* OverlayTexture();
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
@@ -694,6 +697,7 @@ private:
     uint8_t ramp_[768] = {};
     bool ramp_dirty_ = false;
     bool gamma_ = false;
+    Overlay overlay_;  // shown over the frame at present, as the console's video scaler did
     Target* bound_rt_ = nullptr;
     Target* bound_ds_ = nullptr;
     Target* draw_rt_ = nullptr;  // the draw's targets, the bound ones go when a texture's copy is drawn
@@ -2798,6 +2802,10 @@ void D3D12Backend::ResizeSwap() {
 void D3D12Backend::FinishCapture(const Surface& front) {
     CapStep(Surface{});
     if (Target* f = FindTarget(front, false)) CapSave(*f, "final");
+    if (Tex* ov = OverlayTexture()) {
+        D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        CapSave({.res = ov->res.Get(), .state = &st, .fmt = ov->fmt, .w = ov->d.width, .h = ov->d.height}, "overlay");
+    }
     for (auto& t : cap_tex_) {
         char name[32];
         snprintf(name, sizeof(name), "tex_%08X", t.data);
@@ -2868,6 +2876,61 @@ void D3D12Backend::BlitFrame(Target& t) {
     Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
 }
 
+void D3D12Backend::SetOverlay(const Overlay& overlay) {
+    if (overlay.enabled && overlay.surface.header && !overlay_.surface.header)
+        LOGI("d3d12: overlay on, surface %08X format %02X, source %d,%d-%d,%d, destination %d,%d-%d,%d, key %s %08X",
+             overlay.surface.data, overlay.surface.format >> 8 & 0xFF, overlay.src[0], overlay.src[1], overlay.src[2],
+             overlay.src[3], overlay.dst[0], overlay.dst[1], overlay.dst[2], overlay.dst[3],
+             overlay.color_key ? "on" : "off", overlay.key);
+    overlay_ = overlay;
+}
+
+// the overlay surface as a texture, uploaded once a present: the title writes each movie frame with the CPU
+Tex* D3D12Backend::OverlayTexture() {
+    TextureDesc d;
+    if (!overlay_.enabled || !overlay_.surface.header || !DescribeSurface(overlay_.surface, d)) return nullptr;
+    const FormatInfo& fi = Format(d.format);
+    if (fi.compressed || fi.depth || d.cube || d.depth != 1) return nullptr;
+    const uint64_t key = uint64_t(1) << 63 | d.data;  // apart from the textures draws sample
+    Tex& tx = textures_[key];
+    bool same = SameTexture(tx, d);
+    if (!same && !CreateTexture(tx, d, fi, key)) return nullptr;
+    if (!same || tx.frame != presents_ + 1) {
+        tx.frame = presents_ + 1;
+        UploadTexture(tx, d, fi, static_cast<const uint8_t*>(kernel::HostPtr(d.data)), nullptr, same);
+    }
+    return &tx;
+}
+
+// The overlay over the window's image, mapped as BlitFrame maps the frame. A colour keyed overlay shows only where
+// the frame holds the key; that test is not made yet, the whole destination is covered.
+void D3D12Backend::DrawOverlay(const Target& frame) {
+    Tex* tx = OverlayTexture();
+    if (!tx) return;
+    const Overlay& o = overlay_;
+    if (o.color_key) LOG_FIRST(1, "d3d12: colour keyed overlay drawn without its key");
+    bool wide = app::Widescreen();
+    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
+    float w = float(bb_w_), h = float(bb_h_);
+    float vw = std::min(w, h * aspect), vh = vw / aspect;
+    float ox = (w - vw) / 2, oy = (h - vh) / 2;
+    float gw = float(frame.gw), gh = float(frame.gh);
+    float dst[4] = {0, 0, gw, gh};
+    if (o.dst[2] > o.dst[0] && o.dst[3] > o.dst[1])
+        for (int i = 0; i < 4; i++) dst[i] = float(o.dst[i]);
+    float tw = float(tx->d.width), th = float(tx->d.height);
+    float src[4] = {0, 0, tw, th};
+    if (o.src[2] > o.src[0] && o.src[3] > o.src[1])
+        for (int i = 0; i < 4; i++) src[i] = float(o.src[i]);
+    D3D12_VIEWPORT vp{ox + dst[0] * vw / gw, oy + dst[1] * vh / gh, (dst[2] - dst[0]) * vw / gw,
+                      (dst[3] - dst[1]) * vh / gh, 0, 1};
+    D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
+    cl_->RSSetViewports(1, &vp);
+    cl_->RSSetScissorRects(1, &scissor);
+    float uv[4] = {src[0] / tw, src[1] / th, (src[2] - src[0]) / tw, (src[3] - src[1]) / th};
+    Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_});
+}
+
 void D3D12Backend::RenderUi() {
     std::lock_guard lock(app::UiLock());
     ImGui_ImplDX12_NewFrame();
@@ -2889,6 +2952,7 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
+    if (t) DrawOverlay(*t);
     RenderUi();
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
