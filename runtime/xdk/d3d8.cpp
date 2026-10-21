@@ -40,6 +40,10 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define SYM_D3DDevice_SetPalette FFFFFE02
 #define HAS_D3DDevice_SetPalette 0
 #endif
+#ifndef SYM_D3DDevice_UpdateOverlay
+#define SYM_D3DDevice_UpdateOverlay FFFFFE07
+#define HAS_D3DDevice_UpdateOverlay 0
+#endif
 #ifndef SYM_D3DDevice_GetVertexShaderFunction
 #define SYM_D3DDevice_GetVertexShaderFunction FFFFFE03
 #define HAS_D3DDevice_GetVertexShaderFunction 0
@@ -437,6 +441,9 @@ HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
 HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
+// (surface, source rect, destination rect, enable color key, color key): the overlay is not composited yet, so a
+// title that plays movies on it (Forza Motorsport's Bink videos) runs them unseen
+HLE_STDCALL(D3DDevice_UpdateOverlay, 5) { return 0; }
 // the front buffer, read back at the guest size, is kept for the next instance after a quick reboot, which may
 // fade from it at its first frames
 HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
@@ -574,7 +581,13 @@ HLE_STDCALL(D3DDevice_CopyRects, 5) {
 HLE_STDCALL(D3DDevice_SetViewport, 1) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     uint32_t v = a[0];
-    g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    if (v) {
+        g_state.viewport = {R32(v), R32(v + 4), R32(v + 8), R32(v + 12), GF(v + 16), GF(v + 20)};
+    } else {  // no viewport: the whole render target, depth 0 to 1
+        uint32_t w = 0, h = 0;
+        gpu::SurfaceSize(g_state.rt, w, h);
+        g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};
+    }
     g_state.scissor_count = 0;
     UpdateViewportConstants();
     return 0;
