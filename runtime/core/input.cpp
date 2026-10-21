@@ -2,9 +2,14 @@
 #include "core/input.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <mutex>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include <SDL3/SDL.h>
 
@@ -37,6 +42,60 @@ void RemovePad(SDL_JoystickID id) {
         g_pads[i] = nullptr;
         LOGI("input: controller %d unplugged", i + 1);
     }
+}
+
+// XBE_INPUT_SCRIPT: timed presses on a scripted controller in port 1 for unattended runs, "seconds:button[:held]"
+// separated by commas, e.g. "30:start,33:a:0.2" (held defaults to 0.15 s). Buttons: up down left right start back ls
+// rs a b x y black white lt rt. With a script, physical controllers are ignored, so a pad in use elsewhere cannot
+// steer the run.
+struct Press {
+    double at, until;
+    uint16_t buttons;   // Pad::buttons bits
+    uint8_t analog;     // Pad::analog index + 1, 0 for none
+};
+std::vector<Press> g_script;
+bool g_scripted = false;
+uint64_t g_script_start = 0;
+
+void LoadScript() {
+    const char* env = std::getenv("XBE_INPUT_SCRIPT");
+    if (!env || !*env) return;
+    static const std::pair<const char*, int> kNames[] = {
+        {"up", 0}, {"down", 1}, {"left", 2}, {"right", 3}, {"start", 4}, {"back", 5}, {"ls", 6}, {"rs", 7},
+        {"a", 8}, {"b", 9}, {"x", 10}, {"y", 11}, {"black", 12}, {"white", 13}, {"lt", 14}, {"rt", 15}};
+    std::string all = env;
+    size_t pos = 0;
+    while (pos <= all.size()) {
+        size_t end = all.find(',', pos);
+        std::string item = all.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
+        pos = end == std::string::npos ? all.size() + 1 : end + 1;
+        double at = 0, held = 0.15;
+        char name[16] = {};
+        int n = std::sscanf(item.c_str(), "%lf:%15[a-z]:%lf", &at, name, &held);
+        if (n < 2) continue;
+        for (auto [label, index] : kNames) {
+            if (std::strcmp(label, name) != 0) continue;
+            Press press{at, at + held, 0, 0};
+            if (index < 8) press.buttons = uint16_t(1 << index);
+            else press.analog = uint8_t(index - 8 + 1);
+            g_script.push_back(press);
+        }
+    }
+    g_scripted = true;
+    g_script_start = SDL_GetTicks();
+    LOGI("input: scripted controller in port 1, %zu presses; physical controllers ignored", g_script.size());
+}
+
+Pad ScriptedPad() {
+    Pad p;
+    p.connected = true;
+    double now = double(SDL_GetTicks() - g_script_start) / 1000.0;
+    for (const Press& press : g_script) {
+        if (now < press.at || now >= press.until) continue;
+        p.buttons |= press.buttons;
+        if (press.analog) p.analog[press.analog - 1] = 0xFF;
+    }
+    return p;
 }
 
 // once a millisecond at most, however many ports and threads read
@@ -73,6 +132,7 @@ void Init() {
     LOGI("input: SDL %d.%d.%d", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
     std::lock_guard lock(g_lock);
     g_sdl = true;
+    LoadScript();
     int count = 0;
     if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
         for (int i = 0; i < count; i++) AddPad(ids[i]);
@@ -82,7 +142,9 @@ void Init() {
 
 Pad Poll(int port) {
     Pad p;
-    {
+    if (g_scripted) {
+        if (port == 0) p = ScriptedPad();
+    } else {
         std::lock_guard lock(g_lock);
         UpdatePads();
         if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
@@ -118,6 +180,13 @@ uint16_t HeldOnAnyController() {
         {SDL_GAMEPAD_BUTTON_SOUTH, 0x1000}, {SDL_GAMEPAD_BUTTON_EAST, 0x2000},
         {SDL_GAMEPAD_BUTTON_WEST, 0x4000},  {SDL_GAMEPAD_BUTTON_NORTH, 0x8000}};
     std::lock_guard lock(g_lock);
+    if (g_scripted) {
+        Pad p = ScriptedPad();
+        uint16_t held = 0;
+        for (int i = 0; i < 4; i++)
+            if (p.analog[i]) held |= uint16_t(0x1000 << i);
+        return held;
+    }
     UpdatePads();
     uint16_t held = 0;
     for (SDL_Gamepad* pad : g_pads)
