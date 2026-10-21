@@ -11,6 +11,18 @@ inline bool Perf() {
     return on;
 }
 
+// XBE_TRACE_KERNEL set: kernel calls are logged with their first arguments, return value and return address, up to
+// the number it holds per export (200 when it is not a number), so a stall shows the call that never returned
+inline unsigned TraceKernel() {
+    static const unsigned limit = [] {
+        const char* v = std::getenv("XBE_TRACE_KERNEL");
+        if (!v) return 0u;
+        unsigned n = unsigned(std::strtoul(v, nullptr, 10));
+        return n ? n : 200u;
+    }();
+    return limit;
+}
+
 // XBE_CAPTURE_DIR: where F3 saves a frame, empty: F3 does not capture
 inline const std::filesystem::path& CaptureDir() {
     static const std::filesystem::path dir = [] {
@@ -22,6 +34,15 @@ inline const std::filesystem::path& CaptureDir() {
         return v ? std::filesystem::path(v) : std::filesystem::path();
     }();
     return dir;
+}
+
+// XBE_CAPTURE_EVERY: with XBE_CAPTURE_DIR, captures a frame every this many seconds without F3, 0 or unset: never
+inline double CaptureEvery() {
+    static const double seconds = [] {
+        const char* v = std::getenv("XBE_CAPTURE_EVERY");
+        return v ? std::strtod(v, nullptr) : 0.0;
+    }();
+    return seconds;
 }
 
 }  // namespace diag
