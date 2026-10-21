@@ -102,6 +102,16 @@ struct PerfScope {
     ~PerfScope() { acc += PerfMs(t); }
 };
 
+// with diag::CaptureEvery set, true once that many seconds have passed since the last automatic capture
+bool AutoCaptureDue() {
+    if (diag::CaptureEvery() <= 0) return false;
+    static auto last = std::chrono::steady_clock::now();
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration<double>(now - last).count() < diag::CaptureEvery()) return false;
+    last = now;
+    return true;
+}
+
 // F3 captures only with diag::CaptureDir set
 bool CaptureOn() {
     if (diag::CaptureDir().empty()) LOG_FIRST(1, "capture: set XBE_CAPTURE_DIR");
@@ -2965,7 +2975,7 @@ void D3D12Backend::Present(const Surface& front) {
     PerfScope perf_present{g_perf.present};
     if (cap_) {
         FinishCapture(front);
-    } else if (g_capture.exchange(false) && CaptureOn()) {
+    } else if ((g_capture.exchange(false) || AutoCaptureDue()) && CaptureOn()) {
         StartCapture();
     }
     ResizeSwap();
