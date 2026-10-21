@@ -41,7 +41,9 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
-enum class Op : uint8_t { State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport };
+enum class Op : uint8_t {
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Overlay
+};
 
 struct Cmd {
     Op op;
@@ -210,6 +212,15 @@ public:
         Cmd c{Op::Gamma};
         c.data = Put(ramp, 768);
         cur_->cmds.push_back(c);
+    }
+
+    void SetOverlay(const Overlay& o) override {
+        Cmd c{Op::Overlay};
+        c.s1 = o.surface;
+        c.s1.header = Header(o.surface.header);
+        c.data = Put(&o, sizeof(o));
+        cur_->cmds.push_back(c);
+        Use(o.surface.header);
     }
 
     void ClearReport() override { cur_->cmds.push_back(Cmd{Op::ClearReport}); }
@@ -440,6 +451,13 @@ private:
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::ClearReport: inner_->ClearReport(); break;
             case Op::GetReport: inner_->GetReport(c.a); break;
+            case Op::Overlay: {
+                Overlay o;
+                std::memcpy(&o, data, sizeof(o));
+                o.surface = c.s1;
+                inner_->SetOverlay(o);
+                break;
+            }
         }
     }
 

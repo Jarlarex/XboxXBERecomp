@@ -440,10 +440,34 @@ HLE_STDCALL(D3DDevice_BlockUntilVerticalBlank, 0) {
 }
 HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
 HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
-HLE_STDCALL(D3DDevice_EnableOverlay, 1) { return 0; }
-// (surface, source rect, destination rect, enable color key, color key): the overlay is not composited yet, so a
-// title that plays movies on it (Forza Motorsport's Bink videos) runs them unseen
-HLE_STDCALL(D3DDevice_UpdateOverlay, 5) { return 0; }
+// The video overlay, shown over the frame at present: titles play movies on it (Forza Motorsport's Bink videos)
+static gpu::Overlay g_overlay;
+
+static void SendOverlay() {
+    if (g_backend) g_backend->SetOverlay(g_overlay);
+}
+
+HLE_STDCALL(D3DDevice_EnableOverlay, 1) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_overlay.enabled = a[0] != 0;
+    if (!g_overlay.enabled) g_overlay.surface = {};
+    SendOverlay();
+    return 0;
+}
+// (surface, source RECT, destination RECT, enable color key, color key); a null rect is the whole surface or frame
+HLE_STDCALL(D3DDevice_UpdateOverlay, 5) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    g_overlay.enabled = true;
+    g_overlay.surface = SurfaceOf(a[0]);
+    for (int i = 0; i < 4; i++) {
+        g_overlay.src[i] = a[1] ? int32_t(R32(a[1] + i * 4)) : 0;
+        g_overlay.dst[i] = a[2] ? int32_t(R32(a[2] + i * 4)) : 0;
+    }
+    g_overlay.color_key = a[3] != 0;
+    g_overlay.key = a[4];
+    SendOverlay();
+    return 0;
+}
 // the front buffer, read back at the guest size, is kept for the next instance after a quick reboot, which may
 // fade from it at its first frames
 HLE_STDCALL(D3DDevice_PersistDisplay, 0) {

@@ -14,6 +14,18 @@ enum : uint32_t {
     kClearStencil = 0x02,
 };
 
+// The video overlay (D3DDevice_EnableOverlay, D3DDevice_UpdateOverlay): a surface the console's video scaler showed
+// over the frame at scan-out, where titles play movies (Bink in YUY2). Rectangles are left, top, right, bottom; the
+// source in surface pixels, the destination in the frame's (back buffer's) pixels.
+struct Overlay {
+    bool enabled = false;
+    Surface surface;
+    int32_t src[4] = {};
+    int32_t dst[4] = {};
+    bool color_key = false;  // show the overlay only where the frame holds key
+    uint32_t key = 0;
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
@@ -37,6 +49,8 @@ public:
     virtual void RecordLate(uint32_t) {}
     virtual void Flush() = 0;
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
+    // the overlay shown from the next present on
+    virtual void SetOverlay(const Overlay& /*overlay*/) {}
     // visibility tests: draws count passing pixels while simple[kMCountEnable / 4] is set, ClearReport zeroes the
     // count, GetReport writes it to a 16 byte report once the GPU is past those draws; without them it stays pending
     virtual void ClearReport() {}
