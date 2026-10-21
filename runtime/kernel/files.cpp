@@ -502,6 +502,10 @@ KERNEL_EXPORT(202, NtOpenFile, 6) {
 // I/O completes before the call returns: the status block is written, then the file object, the event and the
 // APC are signalled (GetOverlappedResult without an event waits on the file handle)
 static uint32_t Finish(File& f, uint32_t status, uint32_t n, uint32_t event, uint32_t apc, uint32_t apc_ctx, uint32_t iosb) {
+    // as NT's I/O manager: a request that fails at once with an error status leaves the status block alone and neither
+    // signals nor queues anything. Forza Motorsport primes a second overlapped read past the end of a small file and
+    // only works because that read never completes; completing it with STATUS_END_OF_FILE stops it with a disc error.
+    if ((status & 0xC0000000) == 0xC0000000) return status;
     IoStatus(iosb, status, n);
     SetEvent(f);
     Complete(event, apc, apc_ctx, iosb);
@@ -535,7 +539,10 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
     }
     f->pos = pos + n;
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
-    if (!write && len && !n) return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
+    if (!write && len && !n) {
+        LOG_FIRST(64, "read at end of file: %s at %llu, %u bytes", f->xbox.c_str(), (unsigned long long)pos, len);
+        return Finish(*f, kEndOfFile, 0, event, apc, apc_ctx, iosb);
+    }
     return Finish(*f, kSuccess, n, event, apc, apc_ctx, iosb);
 }
 
