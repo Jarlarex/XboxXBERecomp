@@ -123,6 +123,7 @@ bool CloseHandle(uint32_t handle);
 uint32_t DuplicateHandle(uint32_t handle);
 ObjectRef FromPointer(uint32_t guest);  // dispatcher object in guest memory, created on first use
 void Bind(ObjectRef obj, uint32_t guest);
+uint32_t FileObjectBody(const ObjectRef& file);  // FILE_OBJECT shaped body of a file, files.cpp
 ObjectRef FindNamed(const std::string& name);
 void AddNamed(const std::string& name, ObjectRef obj);
 
