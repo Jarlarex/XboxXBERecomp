@@ -126,6 +126,22 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundBuffer_GetVoiceProperties FFFFFF18
 #define HAS_IDirectSoundBuffer_GetVoiceProperties 0
 #endif
+#ifndef SYM_CDirectSoundStream_GetVoiceProperties
+#define SYM_CDirectSoundStream_GetVoiceProperties FFFFFF19
+#define HAS_CDirectSoundStream_GetVoiceProperties 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetLFO
+#define SYM_CDirectSoundStream_SetLFO FFFFFF1A
+#define HAS_CDirectSoundStream_SetLFO 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetOutputBuffer
+#define SYM_CDirectSoundStream_SetOutputBuffer FFFFFF1B
+#define HAS_CDirectSoundStream_SetOutputBuffer 0
+#endif
+#ifndef SYM_CDirectSoundStream_SetPitch
+#define SYM_CDirectSoundStream_SetPitch FFFFFF1C
+#define HAS_CDirectSoundStream_SetPitch 0
+#endif
 
 namespace {
 
@@ -820,7 +836,8 @@ static void AuditExports() {
         SYM(IDirectSoundBuffer_SetPitch), SYM(IDirectSoundBuffer_SetLFO), SYM(IDirectSoundBuffer_SetConeAngles),
         SYM(IDirectSoundBuffer_SetConeOrientation), SYM(IDirectSoundBuffer_SetConeOutsideVolume),
         SYM(IDirectSoundBuffer_SetMode), SYM(IDirectSoundBuffer_SetDopplerFactor), SYM(IDirectSound_CreateSoundStream),
-        SYM(IDirectSoundBuffer_GetVoiceProperties)};
+        SYM(IDirectSoundBuffer_GetVoiceProperties), SYM(CDirectSoundStream_GetVoiceProperties),
+        SYM(CDirectSoundStream_SetLFO), SYM(CDirectSoundStream_SetOutputBuffer), SYM(CDirectSoundStream_SetPitch)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -1088,10 +1105,9 @@ BUFFER(GetStatus, 2) {
     W32(a[1], (v.playing ? 1u : 0u) | (v.playing && v.looping ? 4u : 0u));  // DSBSTATUS_PLAYING, DSBSTATUS_LOOPING
     return 0;
 }
-// (this, DSVOICEPROPS): mix bin count, 8 (bin, volume) pairs, then pitch, 3D distance volume, 3D cone volume,
-// Doppler pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's.
-BUFFER(GetVoiceProperties, 2) {
-    uint32_t out = a[1];
+// DSVOICEPROPS: mix bin count, 8 (bin, volume) pairs, then pitch, 3D distance volume, 3D cone volume, Doppler
+// pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's.
+static void PutVoiceProperties(const Voice& v, uint32_t out) {
     std::memset(HostPtr(out), 0, 4 + 8 * 8 + 6 * 4);
     W32(out, v.nbins);
     for (uint32_t i = 0; i < v.nbins && i < 8; i++) {
@@ -1100,6 +1116,14 @@ BUFFER(GetVoiceProperties, 2) {
     }
     double ratio = v.freq ? double(v.freq) / 48000.0 : double(v.rate) / 48000.0;
     W32(out + 4 + 8 * 8, uint32_t(int32_t(std::lround(4096.0 * std::log2(std::max(ratio, 1e-6))))));
+}
+// pitch: 4096 units an octave from 48 kHz
+static uint32_t PitchFrequency(uint32_t pitch) {
+    return uint32_t(std::lround(48000.0 * std::exp2(double(int32_t(pitch)) / 4096.0)));
+}
+// (this, DSVOICEPROPS)
+BUFFER(GetVoiceProperties, 2) {
+    PutVoiceProperties(v, a[1]);
     return 0;
 }
 BUFFER(GetCurrentPosition, 3) {
@@ -1169,9 +1193,8 @@ BUFFER(SetConeOrientation, 5) { return 0; }
 BUFFER(SetConeOutsideVolume, 3) { return 0; }
 BUFFER(SetDopplerFactor, 3) { return 0; }
 BUFFER(SetLFO, 2) { return 0; }
-// (this, pitch): 4096 units an octave from 48 kHz
 BUFFER(SetPitch, 2) {
-    v.freq = uint32_t(std::lround(48000.0 * std::exp2(double(int32_t(a[1])) / 4096.0)));
+    v.freq = PitchFrequency(a[1]);
     return 0;
 }
 BUFFER(SetI3DL2Source, 3) { return 0; }
@@ -1355,3 +1378,14 @@ STREAM(SetPosition, 5) {
 }
 STREAM(SetVelocity, 5) { return 0; }
 STREAM(SetI3DL2Source, 3) { return 0; }
+// the library's own versions reach the hardware voice behind the stream (XACT calls them on its streams)
+STREAM(GetVoiceProperties, 2) {
+    PutVoiceProperties(v, a[1]);
+    return 0;
+}
+STREAM(SetPitch, 2) {
+    v.freq = PitchFrequency(a[1]);
+    return 0;
+}
+STREAM(SetLFO, 2) { return 0; }
+STREAM(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
