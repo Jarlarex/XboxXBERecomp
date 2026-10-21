@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <condition_variable>
 #include <deque>
@@ -84,6 +85,46 @@ X86Func* Find(uint32_t guest);
 #ifndef SYM_IDirectSoundBuffer_SetEG
 #define SYM_IDirectSoundBuffer_SetEG FFFFFF0E
 #define HAS_IDirectSoundBuffer_SetEG 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_PlayEx
+#define SYM_IDirectSoundBuffer_PlayEx FFFFFF0F
+#define HAS_IDirectSoundBuffer_PlayEx 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetPitch
+#define SYM_IDirectSoundBuffer_SetPitch FFFFFF10
+#define HAS_IDirectSoundBuffer_SetPitch 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetLFO
+#define SYM_IDirectSoundBuffer_SetLFO FFFFFF11
+#define HAS_IDirectSoundBuffer_SetLFO 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetConeAngles
+#define SYM_IDirectSoundBuffer_SetConeAngles FFFFFF12
+#define HAS_IDirectSoundBuffer_SetConeAngles 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetConeOrientation
+#define SYM_IDirectSoundBuffer_SetConeOrientation FFFFFF13
+#define HAS_IDirectSoundBuffer_SetConeOrientation 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetConeOutsideVolume
+#define SYM_IDirectSoundBuffer_SetConeOutsideVolume FFFFFF14
+#define HAS_IDirectSoundBuffer_SetConeOutsideVolume 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetMode
+#define SYM_IDirectSoundBuffer_SetMode FFFFFF15
+#define HAS_IDirectSoundBuffer_SetMode 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_SetDopplerFactor
+#define SYM_IDirectSoundBuffer_SetDopplerFactor FFFFFF16
+#define HAS_IDirectSoundBuffer_SetDopplerFactor 0
+#endif
+#ifndef SYM_IDirectSound_CreateSoundStream
+#define SYM_IDirectSound_CreateSoundStream FFFFFF17
+#define HAS_IDirectSound_CreateSoundStream 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_GetVoiceProperties
+#define SYM_IDirectSoundBuffer_GetVoiceProperties FFFFFF18
+#define HAS_IDirectSoundBuffer_GetVoiceProperties 0
 #endif
 
 namespace {
@@ -632,9 +673,29 @@ void Run(X86Context& ctx, const std::vector<Done>& done) {
     for (const Done& d : done) CallGuest(ctx, d.callback, {d.context, d.packet_context, d.status});
 }
 
+// The MCPX APU's global sample counter (NV_PAPU_XGSCNT, 0xFE80200C), which DirectSound and XACT read directly as
+// their clock: its register page is committed and the counter advances at 48 kHz from the host clock.
+constexpr uint32_t kApuSampleCount = 0xFE80200C;
+
+void StartApuClock() {
+    static bool started = false;
+    if (started) return;
+    started = true;
+    mem::Commit(kApuSampleCount & ~0xFFFu, 0x1000);
+    std::thread([] {
+        auto start = std::chrono::steady_clock::now();
+        for (;;) {
+            auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start);
+            W32(kApuSampleCount, uint32_t(us.count() * 48 / 1000));
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }).detach();
+}
+
 void Start() {
     if (g_started) return;
     g_started = true;
+    StartApuClock();
     audio::StartOutput(Render);
     // for a title that never calls DirectSoundDoWork: its callbacks come from here instead
     StartHostThread("dsound", [](X86Context& ctx) {
@@ -755,7 +816,11 @@ static void AuditExports() {
         SYM(CDirectSoundStream_SetFrequency), SYM(CDirectSoundStream_SetFilter), SYM(CDirectSoundStream_SetHeadroom),
         SYM(CDirectSoundStream_SetMixBinVolumes), SYM(CDirectSoundStream_SetMixBins), SYM(CDirectSoundStream_SetMaxDistance),
         SYM(CDirectSoundStream_SetMinDistance), SYM(CDirectSoundStream_SetPosition), SYM(CDirectSoundStream_SetVelocity),
-        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG)};
+        SYM(CDirectSoundStream_SetI3DL2Source), SYM(IDirectSoundStream_SetEG), SYM(IDirectSoundBuffer_PlayEx),
+        SYM(IDirectSoundBuffer_SetPitch), SYM(IDirectSoundBuffer_SetLFO), SYM(IDirectSoundBuffer_SetConeAngles),
+        SYM(IDirectSoundBuffer_SetConeOrientation), SYM(IDirectSoundBuffer_SetConeOutsideVolume),
+        SYM(IDirectSoundBuffer_SetMode), SYM(IDirectSoundBuffer_SetDopplerFactor), SYM(IDirectSound_CreateSoundStream),
+        SYM(IDirectSoundBuffer_GetVoiceProperties)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -788,8 +853,8 @@ HLE_STDCALL(DirectSoundCreate, 3) {
     return 0;
 }
 HLE_STDCALL(IDirectSound_Release, 1) { return 0; }
-HLE_STDCALL(DirectSoundUseFullHRTF, 0) { return 0; }
-HLE_STDCALL(DirectSoundUseLightHRTF, 0) { return 0; }
+// DirectSoundUseFullHRTF and DirectSoundUseLightHRTF run their original code: they only store the HRTF routine the
+// library's 3D calculator calls, which XACT uses on its own, and touch no DSOUND object
 HLE_STDCALL(IDirectSound_GetSpeakerConfig, 2) {
     W32(a[1], 0);  // DSSPEAKER_STEREO
     return 0;
@@ -977,6 +1042,15 @@ BUFFER(Play, 4) {
     v.sync = a[3] & 4;
     return 0;
 }
+// (this, REFERENCE_TIME, flags): the start time is not honoured, it plays now
+BUFFER(PlayEx, 4) {
+    v.has_gain = false;
+    v.playing = true;
+    v.looping = a[3] & 1;
+    if (a[3] & 2) v.pos = 0;
+    v.sync = a[3] & 4;
+    return 0;
+}
 BUFFER(Stop, 1) {
     v.playing = false;
     return 0;
@@ -1012,6 +1086,20 @@ BUFFER(SetLoopRegion, 3) {
 }
 BUFFER(GetStatus, 2) {
     W32(a[1], (v.playing ? 1u : 0u) | (v.playing && v.looping ? 4u : 0u));  // DSBSTATUS_PLAYING, DSBSTATUS_LOOPING
+    return 0;
+}
+// (this, DSVOICEPROPS): mix bin count, 8 (bin, volume) pairs, then pitch, 3D distance volume, 3D cone volume,
+// Doppler pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's.
+BUFFER(GetVoiceProperties, 2) {
+    uint32_t out = a[1];
+    std::memset(HostPtr(out), 0, 4 + 8 * 8 + 6 * 4);
+    W32(out, v.nbins);
+    for (uint32_t i = 0; i < v.nbins && i < 8; i++) {
+        W32(out + 4 + i * 8, v.bin[i]);
+        W32(out + 8 + i * 8, uint32_t(v.bin_mb[v.bin[i] & 31]));
+    }
+    double ratio = v.freq ? double(v.freq) / 48000.0 : double(v.rate) / 48000.0;
+    W32(out + 4 + 8 * 8, uint32_t(int32_t(std::lround(4096.0 * std::log2(std::max(ratio, 1e-6))))));
     return 0;
 }
 BUFFER(GetCurrentPosition, 3) {
@@ -1070,6 +1158,22 @@ BUFFER(SetPosition, 5) {
     return 0;
 }
 BUFFER(SetVelocity, 5) { return 0; }
+// (this, mode, apply): DS3DMODE_NORMAL, HEADRELATIVE or DISABLE
+BUFFER(SetMode, 3) {
+    v.mode = a[1];
+    return 0;
+}
+// sound cones, Doppler and LFOs are not modelled
+BUFFER(SetConeAngles, 4) { return 0; }
+BUFFER(SetConeOrientation, 5) { return 0; }
+BUFFER(SetConeOutsideVolume, 3) { return 0; }
+BUFFER(SetDopplerFactor, 3) { return 0; }
+BUFFER(SetLFO, 2) { return 0; }
+// (this, pitch): 4096 units an octave from 48 kHz
+BUFFER(SetPitch, 2) {
+    v.freq = uint32_t(std::lround(48000.0 * std::exp2(double(int32_t(a[1])) / 4096.0)));
+    return 0;
+}
 BUFFER(SetI3DL2Source, 3) { return 0; }
 // (this, DS3DBUFFER, apply): position at +4, distances at +0x34 and +0x38, mode at +0x3C
 BUFFER(SetAllParameters, 3) {
@@ -1095,12 +1199,12 @@ BUFFER(SetFormat, 2) {
 
 // streams, the object carries the XDK's own vtable
 
-HLE_STDCALL(DirectSoundCreateStream, 2) {
+// (DSSTREAMDESC, out): DirectSoundCreateStream and IDirectSound_CreateSoundStream
+static uint32_t NewStream(uint32_t desc, uint32_t out) {
     XDK_REQUIRE("dsound", XDK_KEY(CDirectSoundStream_Vtable), XDK_KEY(CDirectSoundStream_Vtable2),
                 XDK_DATA(DSound_StreamVtable), XDK_DATA(DSound_StreamVtable2));
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     Start();
-    uint32_t desc = a[0];
     uint32_t obj = mem::AllocSystem(0x80);
     std::memset(HostPtr(obj), 0, 0x80);
     W32(obj + XDK_CDirectSoundStream_Vtable, kStreamVtable);
@@ -1116,9 +1220,12 @@ HLE_STDCALL(DirectSoundCreateStream, 2) {
     SetBins(v, R32(desc + 20));
     v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
     v.headroom = DefaultHeadroom(flags);
-    W32(a[1], obj);
+    W32(out, obj);
     return 0;
 }
+
+HLE_STDCALL(DirectSoundCreateStream, 2) { return NewStream(a[0], a[1]); }
+HLE_STDCALL(IDirectSound_CreateSoundStream, 4) { return NewStream(a[1], a[2]); }
 
 #define STREAM(name, nargs)                                     \
     static uint32_t str_##name(Voice& v, const Args& a);        \
