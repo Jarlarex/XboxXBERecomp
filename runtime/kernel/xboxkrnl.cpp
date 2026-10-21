@@ -73,7 +73,19 @@ uint64_t InterruptTime() {
     return uint64_t(duration_cast<nanoseconds>(steady_clock::now() - start).count() / 100);
 }
 
+// one processor: no DPC runs while a thread is at dispatch level or above, and titles rely on it (XACT raises to keep
+// its timer DPC off the lists it edits). DPCs run on a host thread of their own here, so dispatch level is a lock,
+// held by a thread from its raise to its lower and by the DPC thread around each routine.
+std::mutex g_dispatch_level;
+
 }  // namespace
+
+void SetIrql(uint8_t irql) {
+    uint8_t& cur = Irql();
+    if (cur < 2 && irql >= 2) g_dispatch_level.lock();
+    if (cur >= 2 && irql < 2) g_dispatch_level.unlock();
+    cur = irql;
+}
 
 uint32_t g_tick_count_va = 0;
 uint32_t g_launch_data_page_va = 0;
@@ -191,25 +203,25 @@ KERNEL_EXPORT(122, KeLeaveCriticalRegion, 0) { return 0; }
 
 KERNEL_FASTCALL(160, KfRaiseIrql) {
     uint8_t old = Irql();
-    Irql() = uint8_t(ctx.ecx);
+    SetIrql(uint8_t(ctx.ecx));
     return old;
 }
 
 KERNEL_FASTCALL(161, KfLowerIrql) {
-    Irql() = uint8_t(ctx.ecx);
+    SetIrql(uint8_t(ctx.ecx));
     return 0;
 }
 
 KERNEL_EXPORT(129, KeRaiseIrqlToDpcLevel, 0) {
     uint8_t old = Irql();
-    Irql() = 2;
+    SetIrql(2);
     return old;
 }
 
 // one processor: synch level is dispatch level
 KERNEL_EXPORT(130, KeRaiseIrqlToSynchLevel, 0) {
     uint8_t old = Irql();
-    Irql() = 2;
+    SetIrql(2);
     return old;
 }
 
