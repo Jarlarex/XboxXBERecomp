@@ -2225,6 +2225,12 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
         fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
+        StagePalette palette;
+        ReadStagePalette(s, i, d, palette);
+        if (palette.va) {
+            fprintf(cap_, " pal %08X %08X %08X %08X %08X", palette.va, palette.colours[0], palette.colours[1],
+                    palette.colours[2], palette.colours[3]);
+        }
         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
         }
@@ -2243,6 +2249,28 @@ void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawC
         fprintf(cap_, " [");
         for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
         fprintf(cap_, " ]");
+    }
+    // direct path: each register's format and offset, then the first vertices of each buffer as floats
+    if (a.vertices.empty()) {
+        for (int r = 0; r < 16; r++) {
+            if (a.regs >> r & 1) {
+                const VertexElement& e = a.elements[size_t(r)];
+                fprintf(cap_, " v%d:b%u+%u/f%u", r, e.buffer, e.offset, e.format);
+            }
+        }
+        for (uint32_t b = 0; b < a.buffer_count; b++) {
+            const VertexBuffer& vb = a.buffers[b];
+            if (!vb.src || !vb.stride) continue;
+            for (uint32_t v = 0; v < 4 && (v + 1) * vb.stride <= vb.bytes; v++) {
+                fprintf(cap_, " b%u[", b);
+                for (uint32_t k = 0; k + 4 <= vb.stride; k += 4) {
+                    float f;
+                    std::memcpy(&f, vb.src + v * vb.stride + k, 4);
+                    fprintf(cap_, " %g", f);
+                }
+                fprintf(cap_, " ]");
+            }
+        }
     }
     for (int r = 0; r < kVsConstants; r++) {
         const auto& v = s.vsc[r];
