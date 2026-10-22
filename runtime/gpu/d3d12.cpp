@@ -2309,6 +2309,10 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     FillSurfaceConstants(s, size, c);
     // points: host pixels per console pixel, also keeps them off the far edge pull out of screen passes
     if (k.topo == uint32_t(Topology::Points)) c.surf[3] = TargetScale();
+    if (SimpleState(s, kMStippleEnable)) {
+        c.stip[0] = TargetScale();
+        for (uint32_t row = 0; row < 32; row++) c.stipple[row] = SimpleState(s, kMStipplePattern + row * 4);
+    }
     FillFogConstants(s, sh.prog, c);
     FillCombinerConstants(s, c);
     if (ext_) ext_->Constants(reinterpret_cast<float(*)[4]>(vc.cpu), c.ext, bound_rt_, k.blend ? k.src : 1);
@@ -2410,6 +2414,8 @@ void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, co
             cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
             k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
             c.pc[0][2], c.pc[0][3]);
+    if (SimpleState(s, kMStippleEnable)) fprintf(cap_, " stipple %08X %08X", c.stipple[0], c.stipple[1]);
+    if (s.rs[kRsTwoSidedLighting]) fprintf(cap_, " twosided");
     CaptureTextures(s, stages);
 }
 

@@ -1691,8 +1691,15 @@ bool ApplyConstant(uint32_t m, uint32_t v) {
     return true;
 }
 
+// the stipple pattern, which D3DDevice_SetStipple pushes itself (Forza Motorsport's 0x3BA500); false for any other method
+bool ApplyStipple(uint32_t m, uint32_t v) {
+    if (m < gpu::kMStipplePattern || m >= gpu::kMStipplePattern + 32 * 4) return false;
+    g_state.simple[m >> 2] = v;
+    return true;
+}
+
 // reads the commands pushed since the last call: vertex data between a begin and an end is drawn, visibility tests
-// are run, constants are stored, the rest is skipped
+// are run, constants and the stipple pattern are stored, the rest is skipped
 void Walk(uint32_t end) {
     if (!g_walk || end < g_walk || end > g_scratch_push + g_scratch_size) return;
     for (uint32_t p = g_walk; p + 4 <= end;) {
@@ -1704,7 +1711,7 @@ void Walk(uint32_t end) {
             uint32_t m = head & 0x40000000 ? method : method + i * 4;
             uint32_t v = R32(p);
             ApplyVisibilityMethod(m, v);
-            if (!ApplyConstant(m, v)) ApplyImmediate(m, v);
+            if (!ApplyConstant(m, v) && !ApplyStipple(m, v)) ApplyImmediate(m, v);
         }
     }
     g_walk = end;
