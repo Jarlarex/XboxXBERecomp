@@ -142,6 +142,22 @@ X86Func* Find(uint32_t guest);
 #define SYM_CDirectSoundStream_SetPitch FFFFFF1C
 #define HAS_CDirectSoundStream_SetPitch 0
 #endif
+#ifndef SYM_IDirectSoundBuffer_Set3DVoiceData
+#define SYM_IDirectSoundBuffer_Set3DVoiceData FFFFFF1D
+#define HAS_IDirectSoundBuffer_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Use3DVoiceData
+#define SYM_IDirectSoundBuffer_Use3DVoiceData FFFFFF1E
+#define HAS_IDirectSoundBuffer_Use3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_Set3DVoiceData
+#define SYM_IDirectSoundStream_Set3DVoiceData FFFFFF1F
+#define HAS_IDirectSoundStream_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_Use3DVoiceData
+#define SYM_IDirectSoundStream_Use3DVoiceData FFFFFF20
+#define HAS_IDirectSoundStream_Use3DVoiceData 0
+#endif
 
 namespace {
 
@@ -168,6 +184,7 @@ enum MixBin : uint32_t {
     kCrosstalkBackRight,
     kFirstSend,  // effect sends from here up
 };
+constexpr uint32_t kI3dl2Send = kFirstSend;  // DSMIXBIN_I3DL2, the reverb's
 constexpr uint32_t kBins = dsp::kBins;
 constexpr uint32_t kInvalidCall = 0x88780032u;  // DSERR_INVALIDCALL
 constexpr uint32_t kMaxChannels = 8;
@@ -180,6 +197,21 @@ constexpr uint32_t kEarLength = 64;  // past the longest interaural delay, 31 sa
 // gain of each row on each mix bin
 struct Gains {
     float bin[kRows][kBins];
+};
+
+// The library's 3D data block of a voice made with DSBCAPS_CTRL3D or with 0x400000, the flag XACT makes its voices
+// with: the 3D calculator's results, which DirectSound writes for its own 3D voices and XACT writes itself through
+// Set3DVoiceData. Volumes in mB, added to the voice's own; zero changes nothing. The HRTF angles and the I3DL2
+// low-pass are kept but not played: the host has no HRTF or voice filter, and XACT gives them only to its 3D submix
+// voices, which the host does not mix.
+struct Data3d {
+    int32_t distance = 0, cone = 0;
+    int32_t front = 0, rear = 0;        // speaker pan: the front 3D bins, the back crosstalk pair
+    int32_t crosstalk = 0, centre = 0;  // the front's share between the crosstalk front pair and the centre
+    int32_t direct = 0, room = 0;       // I3DL2: the 3D bins, the reverb send
+    int32_t doppler = 0;                // pitch, 4096 an octave
+    float azimuth = 0, elevation = 0;   // degrees, the HRTF's
+    uint32_t lowpass[2] = {};           // I3DL2 low-pass coefficients of the direct and room paths, 0xFFFF the most
 };
 
 struct Voice {
@@ -209,6 +241,10 @@ struct Voice {
     bool is3d = false;
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    uint32_t flags = 0;  // creation flags, DSBUFFERDESC's or DSSTREAMDESC's
+    // the 3D data block, which the library makes switched on; the voice's levels and pitch use it while it is on
+    bool has_data3d = false, data3d_on = false;
+    Data3d data3d;
     Gains gain = {};  // the last block's gains, the next block ramps from them
     bool has_gain = false;
     // a mono 3D voice's interaural delay in samples and its recent samples
@@ -251,6 +287,12 @@ void ForgetBlocks(Voice& v) {
 }
 
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
+
+float F32(uint32_t v) {
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+}
 
 uint32_t FramesOf(const Voice& v, uint32_t bytes) {
     if (v.tag == 0x69) return bytes / (36u * v.channels) * 64;  // WAVE_FORMAT_XBOX_ADPCM
@@ -490,6 +532,39 @@ float BinScale(const Place& at, uint32_t b) {
     return at.att;
 }
 
+// the 3D data in use, none while it is switched off
+const Data3d* Data3dOf(const Voice& v) { return v.has_data3d && v.data3d_on ? &v.data3d : nullptr; }
+
+// The 3D data's level on a bin as the library adds it to the voice's volume: distance and cone everywhere, then the
+// pan, the centre share and the I3DL2 direct level on the 3D bins and the room level on the reverb send. Each sum
+// stays within -10000 and 0 mB.
+float Data3dScale(const Voice& v, uint32_t b) {
+    const Data3d* d = Data3dOf(v);
+    if (!d) return 1;
+    auto within = [](int64_t mb) { return int32_t(std::clamp<int64_t>(mb, -10000, 0)); };
+    int64_t mb = within(int64_t(d->distance) + d->cone);
+    if (b == kCentre) {
+        mb += int64_t(d->direct) + d->centre + d->front;
+    } else if (b == kCrosstalkFrontLeft || b == kCrosstalkFrontRight) {
+        mb += int64_t(d->direct) + d->crosstalk + d->front;
+    } else if (b == kCrosstalkBackLeft || b == kCrosstalkBackRight) {
+        mb += int64_t(d->direct) + d->rear;
+    } else if (b == kI3dl2Send) {
+        mb += d->room;
+    }
+    return Db(within(mb));
+}
+
+// the pitch the voice plays at, 4096 an octave from 48 kHz: its frequency's, plus the 3D data's Doppler pitch, which
+// the library adds within -32767 and 8191
+double Pitch(const Voice& v) {
+    double hz = v.freq ? v.freq : v.rate;
+    double pitch = 4096.0 * std::log2(std::max(hz, 1.0) / 48000.0);
+    const Data3d* d = Data3dOf(v);
+    if (!d || !d->doppler) return pitch;
+    return std::clamp(pitch + d->doppler, -32767.0, 8191.0);
+}
+
 // a mono 3D voice's crosstalk bins play its ears: the left bins the left ear, the right bins the right one
 void SplitEars(Gains& g) {
     static const uint32_t kLeft[2] = {kCrosstalkFrontLeft, kCrosstalkBackLeft};
@@ -503,7 +578,7 @@ void SplitEars(Gains& g) {
 Gains Levels(const Voice& v, const Place& at) {
     Gains g = SlotGains(v);
     for (auto& row : g.bin) {
-        for (uint32_t b = 0; b < kBins; b++) row[b] *= BinScale(at, b);
+        for (uint32_t b = 0; b < kBins; b++) row[b] *= BinScale(at, b) * Data3dScale(v, b);
     }
     if (at.on && v.channels == 1) SplitEars(g);
     if (!dsp::Loaded()) RouteWithoutImage(v, g);
@@ -636,6 +711,8 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         if (lane.row < kMaxChannels) read |= 1u << lane.row;
     }
     double rate = double(v.freq ? v.freq : v.rate) / audio::kRate;
+    const Data3d* d3 = Data3dOf(v);
+    if (d3 && d3->doppler) rate = 48000.0 * std::exp2(Pitch(v) / 4096.0) / audio::kRate;
     v.block[v.last ^ 1] = -1;  // the title may have rewritten that block's memory since the last mix
     for (uint32_t i = 0; i < frames; i++) {
         std::optional<Cursor> cursor = v.stream ? StreamFrame(v) : BufferFrame(v);
@@ -761,6 +838,65 @@ void SetBinVolumes(Voice& v, uint32_t mixbins) {
 // 600 mB unless 3D or a mix in or effect in buffer
 float DefaultHeadroom(uint32_t flags) { return flags & 0x382010 ? 1.0f : Db(-600); }
 
+// creation flags: DSBCAPS_CTRL3D and 0x400000 give the voice the 3D data block, switched on
+void SetFlags(Voice& v, uint32_t flags) {
+    v.flags = flags;
+    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
+    v.has_data3d = v.data3d_on = flags & 0x400010;
+    v.headroom = DefaultHeadroom(flags);
+}
+
+// Set3DVoiceData's parameters: dword 0 flags the fields that follow, each at its offset in the block. A voice with
+// no block takes the HRTF angles alone.
+void SetData3d(Voice& v, uint32_t data) {
+    uint32_t flags = R32(data);
+    auto mb = [&](uint32_t offset) { return int32_t(R32(data + offset)); };
+    Data3d& d = v.data3d;
+    if (flags & 0x40) {
+        d.azimuth = F32(R32(data + 0x28));
+        d.elevation = F32(R32(data + 0x2C));
+    }
+    if (!v.has_data3d) return;
+    if (flags & 0x01) d.distance = mb(0x04);
+    if (flags & 0x02) d.cone = mb(0x08);
+    if (flags & 0x04) {
+        d.front = mb(0x0C);
+        d.rear = mb(0x10);
+    }
+    if (flags & 0x08) {
+        d.crosstalk = mb(0x14);
+        d.centre = mb(0x18);
+    }
+    if (flags & 0x10) {
+        d.direct = mb(0x1C);
+        d.room = mb(0x20);
+    }
+    if (flags & 0x20) d.doppler = mb(0x24);
+    if (flags & 0x80) {
+        d.lowpass[0] = R32(data + 0x30) & 0xFFFF;
+        d.lowpass[1] = R32(data + 0x34) & 0xFFFF;
+    }
+}
+
+// verbose: every few seconds, the 3D data of the voices playing with it
+void ReportData3d() {
+    static int64_t next = 0;
+    int64_t now = NowMs();
+    if (now < next) return;
+    next = now + 3000;
+    for (auto& [obj, v] : g_voices) {
+        const Data3d* d = Data3dOf(v);
+        if (!d || !(v.stream ? v.active : v.playing)) continue;
+        char bins[8 * 3 + 1] = {};
+        for (uint32_t i = 0; i < v.nbins; i++) std::snprintf(bins + i * 3, 4, " %02X", v.bin[i]);
+        LOGI("dsound: 3D data on %08X (flags %X, %u channels, bins%s): distance %d cone %d pan %d/%d centre %d/%d "
+             "I3DL2 %d/%d Doppler %d, %.0f Hz; HRTF %.1f/%.1f, low-pass %X/%X",
+             obj, v.flags, v.channels, bins, d->distance, d->cone, d->front, d->rear, d->crosstalk, d->centre,
+             d->direct, d->room, d->doppler, 48000.0 * std::exp2(Pitch(v) / 4096.0), d->azimuth, d->elevation,
+             d->lowpass[0], d->lowpass[1]);
+    }
+}
+
 Voice* Find(uint32_t obj) {
     auto it = g_voices.find(obj);
     return it == g_voices.end() ? nullptr : &it->second;
@@ -776,8 +912,7 @@ uint32_t NewBuffer(uint32_t desc, uint32_t out) {
     uint32_t flags = R32(desc + 4), bytes = R32(desc + 8);  // DSBUFFERDESC: size, flags, bytes, format, mix bins
     ReadFormat(v, R32(desc + 12));
     SetBins(v, R32(desc + 16));
-    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = DefaultHeadroom(flags);
+    SetFlags(v, flags);
     if (bytes) {
         v.data = v.owned = mem::AllocContiguous(bytes, 0, 0xFFFFFFFF, 4);
         v.bytes = v.play_len = v.loop_len = bytes;
@@ -792,12 +927,6 @@ uint32_t EffectState(uint32_t effect, uint32_t offset, uint32_t size) {
     const Segment& state = g_effect_states[effect];
     if (offset > state.bytes || size > state.bytes - offset) return 0;
     return state.at;
-}
-
-float F32(uint32_t v) {
-    float f;
-    std::memcpy(&f, &v, 4);
-    return f;
 }
 
 }  // namespace
@@ -1106,7 +1235,8 @@ BUFFER(GetStatus, 2) {
     return 0;
 }
 // DSVOICEPROPS: mix bin count, 8 (bin, volume) pairs, then pitch, 3D distance volume, 3D cone volume, Doppler
-// pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's.
+// pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's. The pitch
+// is the one playing, with the Doppler pitch in it; the 3D fields are the 3D data's while it is on, else zero.
 static void PutVoiceProperties(const Voice& v, uint32_t out) {
     std::memset(HostPtr(out), 0, 4 + 8 * 8 + 6 * 4);
     W32(out, v.nbins);
@@ -1114,8 +1244,15 @@ static void PutVoiceProperties(const Voice& v, uint32_t out) {
         W32(out + 4 + i * 8, v.bin[i]);
         W32(out + 8 + i * 8, uint32_t(v.bin_mb[v.bin[i] & 31]));
     }
-    double ratio = v.freq ? double(v.freq) / 48000.0 : double(v.rate) / 48000.0;
-    W32(out + 4 + 8 * 8, uint32_t(int32_t(std::lround(4096.0 * std::log2(std::max(ratio, 1e-6))))));
+    uint32_t at = out + 4 + 8 * 8;
+    W32(at, uint32_t(int32_t(std::lround(Pitch(v)))));
+    if (const Data3d* d = Data3dOf(v)) {
+        W32(at + 4, uint32_t(d->distance));
+        W32(at + 8, uint32_t(d->cone));
+        W32(at + 12, uint32_t(d->doppler));
+        W32(at + 16, uint32_t(d->direct));
+        W32(at + 20, uint32_t(d->room));
+    }
 }
 // pitch: 4096 units an octave from 48 kHz
 static uint32_t PitchFrequency(uint32_t pitch) {
@@ -1219,6 +1356,18 @@ BUFFER(SetFormat, 2) {
     ForgetBlocks(v);
     return 0;
 }
+// Unexported methods XACT alone calls, buffer and stream alike, with the 3D calculator's results it worked out
+// itself. (this, data): copies the flagged fields into the voice's 3D data block.
+BUFFER(Set3DVoiceData, 2) {
+    SetData3d(v, a[1]);
+    ReportData3d();
+    return 0;
+}
+// (this, on): switches the 3D data block on or off; XACT turns it on for a 3D sound
+BUFFER(Use3DVoiceData, 2) {
+    v.data3d_on = a[1] != 0;
+    return 0;
+}
 
 // streams, the object carries the XDK's own vtable
 
@@ -1241,8 +1390,7 @@ static uint32_t NewStream(uint32_t desc, uint32_t out) {
     v.callback = R32(desc + 12);
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
-    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = DefaultHeadroom(flags);
+    SetFlags(v, flags);
     W32(out, obj);
     return 0;
 }
@@ -1389,3 +1537,19 @@ STREAM(SetPitch, 2) {
 }
 STREAM(SetLFO, 2) { return 0; }
 STREAM(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+// the stream's 3D data methods, bound at the exports: the bodies they jump to are no functions of their own
+HLE_STDCALL(IDirectSoundStream_Set3DVoiceData, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Voice* v = Find(a[0]);
+    if (!v) return 0x80004005u;
+    SetData3d(*v, a[1]);
+    ReportData3d();
+    return 0;
+}
+HLE_STDCALL(IDirectSoundStream_Use3DVoiceData, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Voice* v = Find(a[0]);
+    if (!v) return 0x80004005u;
+    v->data3d_on = a[1] != 0;
+    return 0;
+}
