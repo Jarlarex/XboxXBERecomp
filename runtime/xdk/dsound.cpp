@@ -142,6 +142,22 @@ X86Func* Find(uint32_t guest);
 #define SYM_CDirectSoundStream_SetPitch FFFFFF1C
 #define HAS_CDirectSoundStream_SetPitch 0
 #endif
+#ifndef SYM_IDirectSoundBuffer_Set3DVoiceData
+#define SYM_IDirectSoundBuffer_Set3DVoiceData FFFFFF1D
+#define HAS_IDirectSoundBuffer_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundBuffer_Use3DVoiceData
+#define SYM_IDirectSoundBuffer_Use3DVoiceData FFFFFF1E
+#define HAS_IDirectSoundBuffer_Use3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_Set3DVoiceData
+#define SYM_IDirectSoundStream_Set3DVoiceData FFFFFF1F
+#define HAS_IDirectSoundStream_Set3DVoiceData 0
+#endif
+#ifndef SYM_IDirectSoundStream_Use3DVoiceData
+#define SYM_IDirectSoundStream_Use3DVoiceData FFFFFF20
+#define HAS_IDirectSoundStream_Use3DVoiceData 0
+#endif
 
 namespace {
 
@@ -168,7 +184,15 @@ enum MixBin : uint32_t {
     kCrosstalkBackRight,
     kFirstSend,  // effect sends from here up
 };
+constexpr uint32_t kI3dl2Send = kFirstSend;  // DSMIXBIN_I3DL2, the reverb's
 constexpr uint32_t kBins = dsp::kBins;
+// A mix-in buffer (DSBCAPS_MIXIN) is a submix: the voice processor runs the voices playing into it first, sending to
+// the last bin, then plays that bin through the submix's own bins. Effect-in buffers (DSBCAPS_FXIN, and 0x100000)
+// read an effect send named in their descriptor instead, which the host does not play back.
+constexpr uint32_t kMixIn = 0x2000, kFxIn = 0x80000, kInputFromDesc = 0x180000;
+constexpr uint32_t kHrtfVoice = 0x200000;  // an HRTF voice without DS3D: XACT's 3D submixes
+constexpr uint8_t kMultipassBin = kBins - 1;
+constexpr uint8_t kNoInput = 0xFF;
 constexpr uint32_t kInvalidCall = 0x88780032u;  // DSERR_INVALIDCALL
 constexpr uint32_t kMaxChannels = 8;
 // rows of a voice's mix: its channels, then a mono 3D voice's two ears
@@ -180,6 +204,20 @@ constexpr uint32_t kEarLength = 64;  // past the longest interaural delay, 31 sa
 // gain of each row on each mix bin
 struct Gains {
     float bin[kRows][kBins];
+};
+
+// The library's 3D data block of a voice made with DSBCAPS_CTRL3D or with 0x400000, the flag XACT makes its voices
+// with: the 3D calculator's results, which DirectSound writes for its own 3D voices and XACT writes itself through
+// Set3DVoiceData. Volumes in mB, added to the voice's own; zero changes nothing. The I3DL2 low-pass is kept but not
+// played (the host has no voice filter), and the HRTF angles give a mono voice its interaural delay alone.
+struct Data3d {
+    int32_t distance = 0, cone = 0;
+    int32_t front = 0, rear = 0;        // speaker pan: the front 3D bins, the back crosstalk pair
+    int32_t crosstalk = 0, centre = 0;  // the front's share between the crosstalk front pair and the centre
+    int32_t direct = 0, room = 0;       // I3DL2: the 3D bins, the reverb send
+    int32_t doppler = 0;                // pitch, 4096 an octave
+    float azimuth = 0, elevation = 0;   // degrees, the HRTF's
+    uint32_t lowpass[2] = {};           // I3DL2 low-pass coefficients of the direct and room paths, 0xFFFF the most
 };
 
 struct Voice {
@@ -209,6 +247,16 @@ struct Voice {
     bool is3d = false;
     uint32_t mode = 0;  // DS3DMODE: 1 head relative, 2 disabled
     float p[3] = {}, min_dist = 1, max_dist = 1e9f;
+    uint32_t flags = 0;  // creation flags, DSBUFFERDESC's or DSSTREAMDESC's
+    // the 3D data block, which the library makes switched on; the voice's levels and pitch use it while it is on
+    bool has_data3d = false, data3d_on = false;
+    Data3d data3d;
+    // submixes: the buffer this voice plays into (SetOutputBuffer), the bin a mix-in or effect-in buffer reads, and
+    // a mix-in buffer's input for the block being mixed, with its peak since the last verbose report
+    uint32_t output = 0;
+    uint8_t input_bin = kNoInput;
+    std::vector<float> input;
+    float input_peak = 0;
     Gains gain = {};  // the last block's gains, the next block ramps from them
     bool has_gain = false;
     // a mono 3D voice's interaural delay in samples and its recent samples
@@ -244,13 +292,59 @@ struct Segment {
     uint32_t bytes;
 };
 std::vector<Segment> g_effect_states;  // each effect's state segment of the downloaded image
+float g_out_peak = 0;  // the loudest output sample, before clamping, since the last verbose report
 
 void ForgetBlocks(Voice& v) {
     v.block[0] = -1;
     v.block[1] = -1;
 }
 
+Voice* Find(uint32_t obj) {
+    auto it = g_voices.find(obj);
+    return it == g_voices.end() ? nullptr : &it->second;
+}
+
+// a submix: a mix-in buffer that reads the multipass bin
+bool IsSubmix(const Voice& v) { return !v.stream && v.input_bin == kMultipassBin; }
+
+// the submix the voice plays into, if it plays into one
+Voice* SubmixOf(const Voice& v) {
+    Voice* to = v.output ? Find(v.output) : nullptr;
+    return to && IsSubmix(*to) ? to : nullptr;
+}
+
+constexpr int kMaxSubmixDepth = 8;  // submixes playing into submixes, a few deep at most
+
+// a voice the voice processor runs: a buffer that plays, a stream that has packets
+bool Running(const Voice& v) { return v.stream ? v.active : v.playing; }
+
+// The library plays a voice's submix when the voice starts, and the submix that one plays into, as a looping
+// buffer with no data of its own.
+void StartSubmixes(const Voice& v) {
+    int hops = 0;
+    for (Voice* to = SubmixOf(v); to && !to->playing && hops < kMaxSubmixDepth; to = SubmixOf(*to), hops++) {
+        to->playing = to->looping = true;
+        to->has_gain = false;
+    }
+}
+
+// It stops a submix when the last voice playing into it stops, and so on down the chain.
+void StopSubmix(Voice* to) {
+    for (int hops = 0; to && to->playing && hops < kMaxSubmixDepth; to = SubmixOf(*to), hops++) {
+        for (auto& [obj, source] : g_voices) {
+            if (source.output == to->obj && Running(source)) return;
+        }
+        to->playing = false;
+    }
+}
+
 float Db(int32_t hundredths) { return hundredths <= -10000 ? 0.0f : std::pow(10.0f, hundredths / 2000.0f); }
+
+float F32(uint32_t v) {
+    float f;
+    std::memcpy(&f, &v, 4);
+    return f;
+}
 
 uint32_t FramesOf(const Voice& v, uint32_t bytes) {
     if (v.tag == 0x69) return bytes / (36u * v.channels) * 64;  // WAVE_FORMAT_XBOX_ADPCM
@@ -333,23 +427,27 @@ constexpr float kFold = 0.707f;
 
 // A voice with no speaker bin and no effects image plays its loudest bin on the front pair; with speaker bins the
 // crosstalk bins join their speakers and effect sends are dropped. Without the title's image nothing reads them.
+// A voice playing into a submix keeps its send to it, and leaves the speakers to the submix.
 void RouteWithoutImage(const Voice& v, Gains& g) {
+    bool submix = SubmixOf(v) != nullptr;
     bool speakers = false;
     for (uint32_t s = 0; s < v.nbins; s++) speakers |= v.bin[s] < kFirstSend && v.bin[s] != kSub;
     if (!v.nbins) speakers = true;
     for (auto& row : g.bin) {
+        float send = submix ? row[kMultipassBin] : 0.0f;
         if (!speakers) {
-            float loudest = *std::max_element(row, row + kBins);
+            float loudest = submix ? 0.0f : *std::max_element(row, row + kBins);
             std::fill(row, row + kBins, 0.0f);
             row[kFrontLeft] = loudest;
             row[kFrontRight] = loudest;
-            continue;
+        } else {
+            row[kFrontLeft] += row[kCrosstalkFrontLeft];
+            row[kFrontRight] += row[kCrosstalkFrontRight];
+            row[kBackLeft] += row[kCrosstalkBackLeft];
+            row[kBackRight] += row[kCrosstalkBackRight];
+            std::fill(row + kCrosstalkFrontLeft, row + kBins, 0.0f);
         }
-        row[kFrontLeft] += row[kCrosstalkFrontLeft];
-        row[kFrontRight] += row[kCrosstalkFrontRight];
-        row[kBackLeft] += row[kCrosstalkBackLeft];
-        row[kBackRight] += row[kCrosstalkBackRight];
-        std::fill(row + kCrosstalkFrontLeft, row + kBins, 0.0f);
+        if (submix) row[kMultipassBin] = send;
     }
 }
 
@@ -385,6 +483,7 @@ Gains SlotGains(const Voice& v) {
 // by the interaural delay, and on a stereo console the back crosstalk pair is silent.
 struct Place {
     bool on = false;
+    bool ears = false;  // an HRTF voice: a mono one plays its crosstalk bins with the interaural delay
     float att = 1;      // distance, every bin
     float front = 1;    // crosstalk front pair
     float centre = 1;   // centre bin
@@ -464,8 +563,18 @@ Place Locate(const Voice& v) {
     static const float kRight[3] = {1, 0, 0};
     static const float kUp[3] = {0, 1, 0};
     Place at;
-    if (!v.is3d || v.mode == 2) return at;
-    at.on = true;
+    if (!v.is3d) {
+        // The library also sets up the HRTF of a voice made with 0x200000 (XACT's 3D submixes), placed by the angles
+        // in its 3D data; the data's own levels place it otherwise.
+        if (v.flags & kHrtfVoice && v.has_data3d) {
+            at.ears = true;
+            at.azimuth = v.data3d.azimuth;
+            at.elevation = v.data3d.elevation;
+        }
+        return at;
+    }
+    if (v.mode == 2) return at;
+    at.on = at.ears = true;
     bool relative = v.mode == 1;  // the position is already in listener space
     float d[3] = {v.p[0], v.p[1], v.p[2]};
     for (int i = 0; i < 3 && !relative; i++) d[i] -= g_listener[i];
@@ -490,6 +599,39 @@ float BinScale(const Place& at, uint32_t b) {
     return at.att;
 }
 
+// the 3D data in use, none while it is switched off
+const Data3d* Data3dOf(const Voice& v) { return v.has_data3d && v.data3d_on ? &v.data3d : nullptr; }
+
+// The 3D data's level on a bin as the library adds it to the voice's volume: distance and cone everywhere, then the
+// pan, the centre share and the I3DL2 direct level on the 3D bins and the room level on the reverb send. Each sum
+// stays within -10000 and 0 mB.
+float Data3dScale(const Voice& v, uint32_t b) {
+    const Data3d* d = Data3dOf(v);
+    if (!d) return 1;
+    auto within = [](int64_t mb) { return int32_t(std::clamp<int64_t>(mb, -10000, 0)); };
+    int64_t mb = within(int64_t(d->distance) + d->cone);
+    if (b == kCentre) {
+        mb += int64_t(d->direct) + d->centre + d->front;
+    } else if (b == kCrosstalkFrontLeft || b == kCrosstalkFrontRight) {
+        mb += int64_t(d->direct) + d->crosstalk + d->front;
+    } else if (b == kCrosstalkBackLeft || b == kCrosstalkBackRight) {
+        mb += int64_t(d->direct) + d->rear;
+    } else if (b == kI3dl2Send) {
+        mb += d->room;
+    }
+    return Db(within(mb));
+}
+
+// the pitch the voice plays at, 4096 an octave from 48 kHz: its frequency's, plus the 3D data's Doppler pitch, which
+// the library adds within -32767 and 8191
+double Pitch(const Voice& v) {
+    double hz = v.freq ? v.freq : v.rate;
+    double pitch = 4096.0 * std::log2(std::max(hz, 1.0) / 48000.0);
+    const Data3d* d = Data3dOf(v);
+    if (!d || !d->doppler) return pitch;
+    return std::clamp(pitch + d->doppler, -32767.0, 8191.0);
+}
+
 // a mono 3D voice's crosstalk bins play its ears: the left bins the left ear, the right bins the right one
 void SplitEars(Gains& g) {
     static const uint32_t kLeft[2] = {kCrosstalkFrontLeft, kCrosstalkBackLeft};
@@ -503,9 +645,9 @@ void SplitEars(Gains& g) {
 Gains Levels(const Voice& v, const Place& at) {
     Gains g = SlotGains(v);
     for (auto& row : g.bin) {
-        for (uint32_t b = 0; b < kBins; b++) row[b] *= BinScale(at, b);
+        for (uint32_t b = 0; b < kBins; b++) row[b] *= BinScale(at, b) * Data3dScale(v, b);
     }
-    if (at.on && v.channels == 1) SplitEars(g);
+    if (at.ears && v.channels == 1) SplitEars(g);
     if (!dsp::Loaded()) RouteWithoutImage(v, g);
     // a sound placed at NaN goes silent alone; its NaN gain would silence the whole mix
     for (auto& row : g.bin) {
@@ -554,7 +696,9 @@ float EarAt(const Voice& v, float delay) {
 // a stream goes quiet: the synch hold ends, a started one loses its pause as well
 void Deactivate(Voice& v) {
     v.sync = false;
-    if (v.active) v.active = v.paused = v.ending = false;
+    if (!v.active) return;
+    v.active = v.paused = v.ending = false;
+    StopSubmix(SubmixOf(v));
 }
 
 // where a frame and the one after it are read from, for interpolation
@@ -601,6 +745,7 @@ std::optional<Cursor> BufferFrame(Voice& v) {
         if (!v.looping || end <= start) {
             v.playing = false;
             v.pos = 0;
+            StopSubmix(SubmixOf(v));
             return std::nullopt;
         }
         v.pos = start + std::fmod(v.pos - start, double(end - start));
@@ -617,8 +762,13 @@ std::optional<Cursor> BufferFrame(Voice& v) {
     return at;
 }
 
-// adds the voice to the bins, frames of kBins interleaved, its levels ramped across the block
+// Adds the voice to the bins, frames of kBins interleaved, its levels ramped across the block. What it sends to the
+// submix it plays into goes to the submix's input instead, and a submix plays its input.
 void MixVoice(Voice& v, float* bins, uint32_t frames) {
+    bool submix = IsSubmix(v);
+    if (submix && v.input.size() < frames) return;
+    Voice* to = SubmixOf(v);
+    float* send = to && to->input.size() >= frames ? to->input.data() : nullptr;
     Place at = Locate(v);
     Gains target = Levels(v, at);
     float itd = Itd(at.azimuth);
@@ -628,7 +778,7 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
     }
     v.has_gain = true;
     std::vector<Lane> lanes = AudibleLanes(v.gain, target, frames);
-    bool ears = at.on && v.channels == 1;
+    bool ears = at.ears && v.channels == 1;
     float itd_step = (itd - v.itd) / float(frames);
     uint32_t channels = std::min<uint32_t>(v.channels, kMaxChannels);
     uint32_t read = ears ? 1u : 0u;  // the channels a lane plays, a bit each
@@ -636,16 +786,23 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         if (lane.row < kMaxChannels) read |= 1u << lane.row;
     }
     double rate = double(v.freq ? v.freq : v.rate) / audio::kRate;
+    const Data3d* d3 = Data3dOf(v);
+    if (d3 && d3->doppler) rate = 48000.0 * std::exp2(Pitch(v) / 4096.0) / audio::kRate;
     v.block[v.last ^ 1] = -1;  // the title may have rewritten that block's memory since the last mix
     for (uint32_t i = 0; i < frames; i++) {
-        std::optional<Cursor> cursor = v.stream ? StreamFrame(v) : BufferFrame(v);
-        if (!cursor) break;
-        float t = float(v.pos - cursor->f);
         float row[kRows] = {};
-        for (uint32_t c = 0; c < channels; c++) {
-            if (!(read >> c & 1)) continue;
-            float x = Sample(v, cursor->data, cursor->f, int(c));
-            row[c] = x + (Sample(v, cursor->next_data, cursor->next_f, int(c)) - x) * t;
+        if (submix) {
+            row[0] = v.input[i];
+        } else {
+            std::optional<Cursor> cursor = v.stream ? StreamFrame(v) : BufferFrame(v);
+            if (!cursor) break;
+            float t = float(v.pos - cursor->f);
+            for (uint32_t c = 0; c < channels; c++) {
+                if (!(read >> c & 1)) continue;
+                float x = Sample(v, cursor->data, cursor->f, int(c));
+                row[c] = x + (Sample(v, cursor->next_data, cursor->next_f, int(c)) - x) * t;
+            }
+            v.pos += rate;
         }
         if (ears) {
             v.itd += itd_step;
@@ -656,27 +813,58 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         float* frame = bins + size_t(i) * kBins;
         for (Lane& lane : lanes) {
             lane.gain += lane.step;
-            frame[lane.bin] += row[lane.row] * lane.gain;
+            float x = row[lane.row] * lane.gain;
+            if (send && lane.bin == kMultipassBin) {
+                send[i] += x;
+            } else {
+                frame[lane.bin] += x;
+            }
         }
-        v.pos += rate;
     }
     v.gain = target;
     v.itd = itd;
 }
 
+bool Sounding(const Voice& v) { return !v.paused && !v.sync && (v.stream || v.playing); }
+
+// how many submixes the voice plays through: the deeper submix plays first
+int Depth(const Voice& v) {
+    int depth = 0;
+    for (const Voice* at = SubmixOf(v); at && depth < kMaxSubmixDepth; at = SubmixOf(*at)) depth++;
+    return depth;
+}
+
+// The voice processor's passes: the voices playing into submixes fill their inputs, then each submix plays before
+// any submix it plays into.
 void Render(float* out, uint32_t frames) {
     static std::vector<float> bins;  // the output thread alone renders
     bins.assign(size_t(frames) * kBins, 0.0f);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
+    std::vector<std::pair<int, Voice*>> submixes;
     for (auto& [obj, v] : g_voices) {
-        if (v.paused || v.sync || (!v.stream && !v.playing)) continue;
-        MixVoice(v, bins.data(), frames);
+        if (!IsSubmix(v)) continue;
+        v.input.assign(frames, 0.0f);
+        submixes.push_back({Depth(v), &v});
+    }
+    for (auto& [obj, v] : g_voices) {
+        if (!IsSubmix(v) && Sounding(v)) MixVoice(v, bins.data(), frames);
+    }
+    std::stable_sort(submixes.begin(), submixes.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    for (auto& [depth, v] : submixes) {
+        float peak = 0;
+        for (float x : v->input) peak = std::max(peak, std::fabs(x));
+        v->input_peak = std::max(v->input_peak, peak);
+        // the block its last voice stopped in still plays
+        if (Sounding(*v) || peak > 0) MixVoice(*v, bins.data(), frames);
     }
     if (dsp::Loaded()) dsp::Run(bins.data(), frames);
     for (uint32_t i = 0; i < frames; i++) {
         const float* b = &bins[size_t(i) * kBins];
-        out[i * 2] = std::clamp(b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]), -1.0f, 1.0f);
-        out[i * 2 + 1] = std::clamp(b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]), -1.0f, 1.0f);
+        float left = b[kFrontLeft] + kFold * (b[kCentre] + b[kBackLeft]);
+        float right = b[kFrontRight] + kFold * (b[kCentre] + b[kBackRight]);
+        g_out_peak = std::max({g_out_peak, std::fabs(left), std::fabs(right)});
+        out[i * 2] = std::clamp(left, -1.0f, 1.0f);
+        out[i * 2 + 1] = std::clamp(right, -1.0f, 1.0f);
     }
 }
 
@@ -761,10 +949,95 @@ void SetBinVolumes(Voice& v, uint32_t mixbins) {
 // 600 mB unless 3D or a mix in or effect in buffer
 float DefaultHeadroom(uint32_t flags) { return flags & 0x382010 ? 1.0f : Db(-600); }
 
-Voice* Find(uint32_t obj) {
-    auto it = g_voices.find(obj);
-    return it == g_voices.end() ? nullptr : &it->second;
+// creation flags: DSBCAPS_CTRL3D and 0x400000 give the voice the 3D data block, switched on
+void SetFlags(Voice& v, uint32_t flags) {
+    v.flags = flags;
+    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
+    v.has_data3d = v.data3d_on = flags & 0x400010;
+    v.headroom = DefaultHeadroom(flags);
 }
+
+// Set3DVoiceData's parameters: dword 0 flags the fields that follow, each at its offset in the block. A voice with
+// no block takes the HRTF angles alone.
+void SetData3d(Voice& v, uint32_t data) {
+    uint32_t flags = R32(data);
+    auto mb = [&](uint32_t offset) { return int32_t(R32(data + offset)); };
+    Data3d& d = v.data3d;
+    if (flags & 0x40) {
+        d.azimuth = F32(R32(data + 0x28));
+        d.elevation = F32(R32(data + 0x2C));
+    }
+    if (!v.has_data3d) return;
+    if (flags & 0x01) d.distance = mb(0x04);
+    if (flags & 0x02) d.cone = mb(0x08);
+    if (flags & 0x04) {
+        d.front = mb(0x0C);
+        d.rear = mb(0x10);
+    }
+    if (flags & 0x08) {
+        d.crosstalk = mb(0x14);
+        d.centre = mb(0x18);
+    }
+    if (flags & 0x10) {
+        d.direct = mb(0x1C);
+        d.room = mb(0x20);
+    }
+    if (flags & 0x20) d.doppler = mb(0x24);
+    if (flags & 0x80) {
+        d.lowpass[0] = R32(data + 0x30) & 0xFFFF;
+        d.lowpass[1] = R32(data + 0x34) & 0xFFFF;
+    }
+}
+
+// verbose: every few seconds, the 3D data of the voices playing with it and what each submix takes in
+void ReportMix() {
+    static int64_t next = 0;
+    int64_t now = NowMs();
+    if (now < next) return;
+    next = now + 3000;
+    LOGI("dsound: output peak %.3f", g_out_peak);
+    g_out_peak = 0;
+    for (auto& [obj, v] : g_voices) {
+        const Data3d* d = Data3dOf(v);
+        uint32_t sources = 0;
+        if (IsSubmix(v)) {
+            for (auto& [other, source] : g_voices) sources += source.output == obj;
+        }
+        bool sounding = v.stream ? v.active : v.playing;
+        if (!(d && sounding) && !sources) continue;
+        char bins[8 * 3 + 1] = {};
+        for (uint32_t i = 0; i < v.nbins; i++) std::snprintf(bins + i * 3, 4, " %02X", v.bin[i]);
+        char submix[96] = {};
+        if (IsSubmix(v)) {
+            std::snprintf(submix, sizeof submix, "; submix %s, %u voices in, peak %.3f",
+                          sounding ? "playing" : "stopped", sources, v.input_peak);
+            v.input_peak = 0;
+        }
+        Data3d none;
+        if (!d) d = &none;
+        LOGI("dsound: %08X (flags %X, %u channels, bins%s): 3D distance %d cone %d pan %d/%d centre %d/%d I3DL2 %d/%d "
+             "Doppler %d, %.0f Hz; HRTF %.1f/%.1f, low-pass %X/%X%s",
+             obj, v.flags, v.channels, bins, d->distance, d->cone, d->front, d->rear, d->crosstalk, d->centre,
+             d->direct, d->room, d->doppler, 48000.0 * std::exp2(Pitch(v) / 4096.0), d->azimuth, d->elevation,
+             d->lowpass[0], d->lowpass[1], submix);
+    }
+}
+
+// a level in mB
+int32_t Mb(float level) { return level <= 0 ? -10000 : int32_t(std::lround(2000.0 * std::log10(level))); }
+
+// The library adds the input bin of the buffer a voice plays into once for each of the voice's channels, after the
+// voice's own bins, cutting them short to make room.
+void AddInputBin(Voice& v, uint8_t bin) {
+    uint32_t channels = std::min<uint32_t>(v.channels, 8);
+    uint32_t have = uint32_t(std::count(v.bin, v.bin + v.nbins, bin));
+    if (have >= channels) return;
+    uint32_t need = channels - have;
+    if (v.nbins + need > 8) v.nbins = uint8_t(8 - need);
+    while (need--) v.bin[v.nbins++] = bin;
+}
+
+void RemoveBin(Voice& v, uint8_t bin) { v.nbins = uint8_t(std::remove(v.bin, v.bin + v.nbins, bin) - v.bin); }
 
 uint32_t NewBuffer(uint32_t desc, uint32_t out) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
@@ -773,11 +1046,15 @@ uint32_t NewBuffer(uint32_t desc, uint32_t out) {
     std::memset(HostPtr(obj), 0, 0x40);
     Voice& v = g_voices[obj];
     v.obj = obj;
-    uint32_t flags = R32(desc + 4), bytes = R32(desc + 8);  // DSBUFFERDESC: size, flags, bytes, format, mix bins
+    // DSBUFFERDESC: size, flags, bytes, format, mix bins, input mix bin
+    uint32_t flags = R32(desc + 4), bytes = R32(desc + 8);
     ReadFormat(v, R32(desc + 12));
     SetBins(v, R32(desc + 16));
-    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = DefaultHeadroom(flags);
+    SetFlags(v, flags);
+    // the bin a mix-in or effect-in buffer reads: an effect-in buffer's from the descriptor, a mix-in buffer's the
+    // multipass bin, which is one channel
+    if (flags & (kMixIn | kFxIn)) v.input_bin = flags & kInputFromDesc ? uint8_t(R32(desc + 20) & 31) : kMultipassBin;
+    if (IsSubmix(v)) v.channels = 1;
     if (bytes) {
         v.data = v.owned = mem::AllocContiguous(bytes, 0, 0xFFFFFFFF, 4);
         v.bytes = v.play_len = v.loop_len = bytes;
@@ -792,12 +1069,6 @@ uint32_t EffectState(uint32_t effect, uint32_t offset, uint32_t size) {
     const Segment& state = g_effect_states[effect];
     if (offset > state.bytes || size > state.bytes - offset) return 0;
     return state.at;
-}
-
-float F32(uint32_t v) {
-    float f;
-    std::memcpy(&f, &v, 4);
-    return f;
 }
 
 }  // namespace
@@ -1027,14 +1298,49 @@ HLE_STDCALL(IDirectSound_CreateSoundBuffer, 4) { return NewBuffer(a[1], a[2]); }
     }                                                       \
     static uint32_t buf_##name([[maybe_unused]] Voice& v, [[maybe_unused]] const Args& a)
 
-BUFFER(Release, 1) {
+static uint32_t ReleaseBuffer(Voice& v);
+
+// SetOutputBuffer (this, buffer): the voice plays into another buffer, which it holds a reference to. A mix-in or
+// effect-in buffer takes the voice through its input bin, which replaces the voice's bins at 1/channels; SetMixBins
+// adds it back after the bins it sets.
+static void SetOutput(Voice& v, uint32_t to) {
+    if (to == v.output) return;
+    Voice* old = v.output ? Find(v.output) : nullptr;
+    v.output = 0;
+    if (old) {
+        if (old->input_bin != kNoInput) RemoveBin(v, old->input_bin);
+        if (IsSubmix(*old)) StopSubmix(old);
+        ReleaseBuffer(*old);
+    }
+    Voice* dest = to ? Find(to) : nullptr;
+    if (!dest || dest->stream) return;
+    dest->refs++;
+    v.output = to;
+    if (dest->input_bin == kNoInput) return;
+    v.nbins = 0;
+    AddInputBin(v, dest->input_bin);
+    v.bin_mb[dest->input_bin] = Mb(1.0f / float(std::max<uint16_t>(v.channels, 1)));
+    if (Running(v)) StartSubmixes(v);
+}
+
+// SetMixBins: the bins, then the input bin of the buffer the voice plays into
+static void SetBinsKeepingInput(Voice& v, uint32_t mixbins) {
+    SetBins(v, mixbins);
+    if (Voice* to = v.output ? Find(v.output) : nullptr; to && to->input_bin != kNoInput) AddInputBin(v, to->input_bin);
+}
+
+// a buffer's last release lets go of the buffer it plays into, its memory and its object
+static uint32_t ReleaseBuffer(Voice& v) {
     if (--v.refs > 0) return uint32_t(v.refs);
+    SetOutput(v, 0);
     if (v.owned) mem::FreeContiguous(v.owned);
     uint32_t obj = v.obj;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
     return 0;
 }
+
+BUFFER(Release, 1) { return ReleaseBuffer(v); }
 BUFFER(Unlock, 5) { return 0; }
 BUFFER(SetBufferData, 3) {
     if (a[1] == v.data && a[2] == v.bytes) return 0;
@@ -1057,6 +1363,7 @@ BUFFER(Play, 4) {
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
+    StartSubmixes(v);
     return 0;
 }
 // (this, REFERENCE_TIME, flags): the start time is not honoured, it plays now
@@ -1066,15 +1373,18 @@ BUFFER(PlayEx, 4) {
     v.looping = a[3] & 1;
     if (a[3] & 2) v.pos = 0;
     v.sync = a[3] & 4;
+    StartSubmixes(v);
     return 0;
 }
 BUFFER(Stop, 1) {
     v.playing = false;
+    StopSubmix(SubmixOf(v));
     return 0;
 }
 // (this, time low, time high, flags): stops now, the release envelope is not reproduced
 BUFFER(StopEx, 4) {
     v.playing = false;
+    StopSubmix(SubmixOf(v));
     return 0;
 }
 // (this, flags): 0 resumes, 1 pauses, 2 holds until IDirectSound_SynchPlayback
@@ -1106,7 +1416,8 @@ BUFFER(GetStatus, 2) {
     return 0;
 }
 // DSVOICEPROPS: mix bin count, 8 (bin, volume) pairs, then pitch, 3D distance volume, 3D cone volume, Doppler
-// pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's.
+// pitch, I3DL2 direct and room volumes. XACT reads it; the voice's own levels stand in for the hardware's. The pitch
+// is the one playing, with the Doppler pitch in it; the 3D fields are the 3D data's while it is on, else zero.
 static void PutVoiceProperties(const Voice& v, uint32_t out) {
     std::memset(HostPtr(out), 0, 4 + 8 * 8 + 6 * 4);
     W32(out, v.nbins);
@@ -1114,8 +1425,15 @@ static void PutVoiceProperties(const Voice& v, uint32_t out) {
         W32(out + 4 + i * 8, v.bin[i]);
         W32(out + 8 + i * 8, uint32_t(v.bin_mb[v.bin[i] & 31]));
     }
-    double ratio = v.freq ? double(v.freq) / 48000.0 : double(v.rate) / 48000.0;
-    W32(out + 4 + 8 * 8, uint32_t(int32_t(std::lround(4096.0 * std::log2(std::max(ratio, 1e-6))))));
+    uint32_t at = out + 4 + 8 * 8;
+    W32(at, uint32_t(int32_t(std::lround(Pitch(v)))));
+    if (const Data3d* d = Data3dOf(v)) {
+        W32(at + 4, uint32_t(d->distance));
+        W32(at + 8, uint32_t(d->cone));
+        W32(at + 12, uint32_t(d->doppler));
+        W32(at + 16, uint32_t(d->direct));
+        W32(at + 20, uint32_t(d->room));
+    }
 }
 // pitch: 4096 units an octave from 48 kHz
 static uint32_t PitchFrequency(uint32_t pitch) {
@@ -1166,7 +1484,7 @@ BUFFER(SetMixBinVolumes, 2) {
     return 0;
 }
 BUFFER(SetMixBins, 2) {
-    SetBins(v, a[1]);
+    SetBinsKeepingInput(v, a[1]);
     return 0;
 }
 BUFFER(SetMaxDistance, 3) {
@@ -1212,11 +1530,27 @@ BUFFER(SetRolloffCurve, 4) {
     for (uint32_t i = 0; a[1] && i < std::min<uint32_t>(a[2], 64); i++) v.curve.push_back(F32(R32(a[1] + i * 4)));
     return 0;
 }
-BUFFER(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+BUFFER(SetOutputBuffer, 2) {
+    SetOutput(v, a[1]);
+    ReportMix();
+    return 0;
+}
 BUFFER(SetFormat, 2) {
     ReadFormat(v, a[1]);
     v.freq = 0;
     ForgetBlocks(v);
+    return 0;
+}
+// Unexported methods XACT alone calls, buffer and stream alike, with the 3D calculator's results it worked out
+// itself. (this, data): copies the flagged fields into the voice's 3D data block.
+BUFFER(Set3DVoiceData, 2) {
+    SetData3d(v, a[1]);
+    ReportMix();
+    return 0;
+}
+// (this, on): switches the 3D data block on or off; XACT turns it on for a 3D sound
+BUFFER(Use3DVoiceData, 2) {
+    v.data3d_on = a[1] != 0;
     return 0;
 }
 
@@ -1241,8 +1575,7 @@ static uint32_t NewStream(uint32_t desc, uint32_t out) {
     v.callback = R32(desc + 12);
     v.context = R32(desc + 16);
     SetBins(v, R32(desc + 20));
-    v.is3d = flags & 0x10;  // DSBCAPS_CTRL3D
-    v.headroom = DefaultHeadroom(flags);
+    SetFlags(v, flags);
     W32(out, obj);
     return 0;
 }
@@ -1293,6 +1626,7 @@ STREAM(SetFormat, 2) {
 STREAM(Release, 1) {
     if (--v.refs > 0) return uint32_t(v.refs);
     FlushStream(v);
+    SetOutput(v, 0);
     uint32_t obj = v.obj;
     g_voices.erase(obj);
     mem::FreeSystem(obj);
@@ -1317,8 +1651,10 @@ STREAM(Process, 3) {
     if (pk.completed_ptr) W32(pk.completed_ptr, 0);
     if (pk.status_ptr) W32(pk.status_ptr, kPacketPending);
     v.packets.push_back(pk);
-    if (!v.active) v.has_gain = false;  // after going quiet a stream starts its levels fresh
+    bool starting = !v.active;
+    if (starting) v.has_gain = false;  // after going quiet a stream starts its levels fresh
     v.active = true;
+    if (starting) StartSubmixes(v);
     v.ending = false;
     return 0;
 }
@@ -1361,7 +1697,7 @@ STREAM(SetMixBinVolumes, 2) {
     return 0;
 }
 STREAM(SetMixBins, 2) {
-    SetBins(v, a[1]);
+    SetBinsKeepingInput(v, a[1]);
     return 0;
 }
 STREAM(SetMaxDistance, 3) {
@@ -1388,4 +1724,24 @@ STREAM(SetPitch, 2) {
     return 0;
 }
 STREAM(SetLFO, 2) { return 0; }
-STREAM(SetOutputBuffer, 2) { return 0; }  // the voice keeps its own mix bins
+STREAM(SetOutputBuffer, 2) {
+    SetOutput(v, a[1]);
+    ReportMix();
+    return 0;
+}
+// the stream's 3D data methods, bound at the exports: the bodies they jump to are no functions of their own
+HLE_STDCALL(IDirectSoundStream_Set3DVoiceData, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Voice* v = Find(a[0]);
+    if (!v) return 0x80004005u;
+    SetData3d(*v, a[1]);
+    ReportMix();
+    return 0;
+}
+HLE_STDCALL(IDirectSoundStream_Use3DVoiceData, 2) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    Voice* v = Find(a[0]);
+    if (!v) return 0x80004005u;
+    v->data3d_on = a[1] != 0;
+    return 0;
+}
