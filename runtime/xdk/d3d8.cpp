@@ -4,7 +4,12 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <map>
+#include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -717,8 +722,16 @@ HLE_STDCALL(D3DDevice_GetRasterStatus, 1) {
     W32(a[0] + 4, line < shown ? line : 0);
     return 0;
 }
-HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) { return 0; }
-HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) { return 0; }
+// The TV encoder's vertical filters for interlaced output (flicker 0 to 5, the soft display filter on or off): they
+// soften the picture and leave its levels alone, and a progressive window has no fields to steady.
+HLE_STDCALL(D3DDevice_SetFlickerFilter, 1) {
+    LOG_FIRST(4, "d3d: SetFlickerFilter %u (not reproduced)", a[0]);
+    return 0;
+}
+HLE_STDCALL(D3DDevice_SetSoftDisplayFilter, 1) {
+    LOG_FIRST(4, "d3d: SetSoftDisplayFilter %u (not reproduced)", a[0]);
+    return 0;
+}
 // The video overlay, shown over the frame at present: titles play movies on it (Forza Motorsport's Bink videos)
 static gpu::Overlay g_overlay;
 
@@ -763,10 +776,49 @@ HLE_STDCALL(D3DDevice_PersistDisplay, 0) {
 }
 HLE_STDCALL(D3DDevice_FlushVertexCache, 0) { return 0; }
 
+// verbose: the gamma ramps a title sets (D3DGAMMARAMP, red, green and blue 256 bytes each), by what they make of a few
+// levels, to tell a brightness or contrast setting from the identity. A step of a fade (every level scaled by one
+// factor, the same in each channel) is only counted, and the count is logged when the identity comes back.
+static void LogGammaRamp(const uint8_t* ramp, const char* how) {
+    static std::mutex lock;
+    static uint8_t last[768];
+    static bool identity_logged = false;
+    static unsigned fade_steps = 0;
+    std::lock_guard<std::mutex> guard(lock);
+    bool identity = true, fade = true;
+    for (int i = 0; i < 768; i++) {
+        identity &= ramp[i] == (i & 0xFF);
+        fade &= ramp[i] == ramp[i & 0xFF] && std::abs(ramp[i & 0xFF] * 255 - (i & 0xFF) * ramp[255]) <= 255;
+    }
+    if (identity) {
+        if (!identity_logged) LOGI("d3d: gamma ramp (%s): identity, after %u fade steps", how, fade_steps);
+        identity_logged = true;
+        fade_steps = 0;
+        return;
+    }
+    identity_logged = false;
+    if (fade) {
+        fade_steps++;
+        return;
+    }
+    if (!std::memcmp(last, ramp, sizeof(last))) return;
+    std::memcpy(last, ramp, sizeof(last));
+    constexpr int kLevels[] = {0, 16, 32, 64, 128, 192, 235, 255};
+    std::string text;
+    for (int c = 0; c < 3; c++) {
+        text += c == 0 ? "red" : c == 1 ? ", green" : ", blue";
+        for (int level : kLevels) text += " " + std::to_string(ramp[c * 256 + level]);
+    }
+    LOGI("d3d: gamma ramp (%s), levels 0 16 32 64 128 192 235 255 become: %s", how, text.c_str());
+}
+
 // The library keeps the ramp in one of two device slots for GetGammaRamp: both get it, whichever one its index names
 HLE_STDCALL(D3DDevice_SetGammaRamp, 2) {
     uint8_t ramp[768];
     std::memcpy(ramp, HostPtr(a[1]), 768);
+    char how[32];
+    std::snprintf(how, sizeof(how), "SetGammaRamp, flags %X", a[0]);
+    LogGammaRamp(ramp, how);
     if (XDK_CDevice_GammaRamps != xdk::kUnknown)
         for (uint32_t slot = 0; slot < 2; slot++)
             std::memcpy(HostPtr(kDevice + XDK_CDevice_GammaRamps + slot * sizeof(ramp)), ramp, sizeof(ramp));
@@ -946,7 +998,9 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
         uint32_t i = Dev(kDevSwapCount) & 1;
         if (Dev(XDK_CDevice_GammaPending + i * 4) == 1) {
             SetDev(XDK_CDevice_GammaPending + i * 4, 0);
-            g_backend->SetGamma(static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300)));
+            const uint8_t* ramp = static_cast<const uint8_t*>(HostPtr(kDevice + XDK_CDevice_GammaRamps + i * 0x300));
+            LogGammaRamp(ramp, "inlined, at Swap");
+            g_backend->SetGamma(ramp);
         }
     }
     Walk(Dev(kDevPush));  // reports asked for at the end of the frame

@@ -76,7 +76,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. `XBE_MULTISAMPLE_TYPE` and `XBE_BACKBUFFER_SCALE` replace a title's multisample type and back buffer scale, to try the other frame buffer models.
+- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. `XBE_MULTISAMPLE_TYPE` and `XBE_BACKBUFFER_SCALE` replace a title's multisample type and back buffer scale, to try the other frame buffer models. `XBE_TRACE_READS` logs each read of the files whose path holds its text, to see what a title streams. A verbose log names each controller's SDL driver and says when the keyboard takes port 1, and reports the gamma ramps a title sets and whether Windows HDR is on for the window's monitor.
 - **Scripted Controller** - `XBE_INPUT_SCRIPT` presses buttons and moves the left or right stick on a controller in port 1 at set times for unattended runs, and can hold its clock until the game logs a given line (a file open, say), so a script follows loading times. The syntax is in the comment above `LoadScript` in `runtime/core/input.cpp`.
 - **Headless Harness** - Builds and runs a game on Linux without a window, GPU, audio or controller, for testing.
 - **SDK Sync** - Keeps the `sdk/` copies in game repositories in step with this repository.

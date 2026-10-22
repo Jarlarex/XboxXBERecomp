@@ -202,6 +202,25 @@ float Bits(uint32_t v) {
     return f;
 }
 
+// Whether Windows runs the monitor in HDR, -1 when no output reports it. The compositor then maps this SDR frame into
+// HDR with the piecewise sRGB curve, which shows the dark end lighter than a 2.2 gamma display does. A factory keeps
+// the outputs' state from when it was made, so each look takes a new one.
+int MonitorHdr(HMONITOR monitor) {
+    ComPtr<IDXGIFactory1> factory;
+    if (!monitor || FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return -1;
+    ComPtr<IDXGIAdapter1> adapter;
+    for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
+        ComPtr<IDXGIOutput> output;
+        for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
+            ComPtr<IDXGIOutput6> output6;
+            DXGI_OUTPUT_DESC1 d;
+            if (SUCCEEDED(output.As(&output6)) && SUCCEEDED(output6->GetDesc1(&d)) && d.Monitor == monitor)
+                return d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+        }
+    }
+    return -1;
+}
+
 void Color(uint32_t argb, float* o) {
     o[0] = ((argb >> 16) & 255) / 255.0f;
     o[1] = ((argb >> 8) & 255) / 255.0f;
@@ -801,6 +820,7 @@ private:
     bool tearing_ = false;
     UINT sync_interval_ = 1;      // display refreshes a presented frame stays up
     uint64_t sync_checked_ = 0;   // presents_ when the display's rate was last read
+    int hdr_ = -2;                // MonitorHdr as last logged, -2 before the first look
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -3395,6 +3415,14 @@ void D3D12Backend::Present(const Surface& front) {
             LOGI("d3d12: %u display refresh%s a frame (display %u Hz, cap %u fps)", n, n == 1 ? "" : "es",
                  unsigned(dm.dmDisplayFrequency), cap);
         sync_interval_ = n;
+    }
+    if (presents_ % 300 == 0) {
+        HWND hwnd = static_cast<HWND>(app::Window());
+        int hdr = MonitorHdr(hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr);
+        if (hdr != hdr_)
+            LOGI("d3d12: Windows HDR is %s on the window's monitor%s", hdr < 0 ? "unknown" : hdr ? "on" : "off",
+                 hdr > 0 ? ": the SDR frame is shown through Windows' SDR mapping, which lifts dark tones" : "");
+        hdr_ = hdr;
     }
     auto perf_swap = PerfClock::now();
     swap_->Present(vsync ? sync_interval_ : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
