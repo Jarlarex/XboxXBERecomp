@@ -188,6 +188,9 @@ struct State {
     // samples a pixel across and down of the render target and its depth buffer: the multisampled back buffer's while
     // the device's back buffer is the target (the console's test), else 1; the console draws on a grid that much smaller
     uint32_t aa_x = 1, aa_y = 1;
+    // D3D's scaling of the title's coordinates onto that grid (supersampling, a back buffer scale other than 1): the
+    // viewport, scissors and clear rects come scaled, screen space vertices are scaled when drawn
+    float ss_x = 1, ss_y = 1;
 };
 
 }  // namespace gpu
