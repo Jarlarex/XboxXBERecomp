@@ -330,7 +330,18 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
     if (f.compressed) {
         uint32_t bw = std::max(1u, (w + 3) / 4), bh = std::max(1u, (h + 3) / 4);
         row_pitch = bw * f.bits;
-        out.assign(src, src + size_t(row_pitch) * bh * z);
+        if (z == 1) {
+            out.assign(src, src + size_t(row_pitch) * bh);
+            return;
+        }
+        // a compressed volume keeps the slices of one block position side by side: block (x, y)'s slice k is
+        // block number (y * blocks across + x) * depth + k, so every slice is every depth-th block
+        out.resize(size_t(row_pitch) * bh * z);
+        for (uint32_t k = 0; k < z; k++)
+            for (uint32_t y = 0; y < bh; y++)
+                for (uint32_t x = 0; x < bw; x++)
+                    std::memcpy(&out[(size_t(k) * bh + y) * row_pitch + size_t(x) * f.bits],
+                                src + (size_t(y) * bw + x) * z * f.bits + size_t(k) * f.bits, f.bits);
         return;
     }
     if (f.host == Host::R32F) {
