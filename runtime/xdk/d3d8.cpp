@@ -494,11 +494,29 @@ constexpr bool kVBlank = XDK_CDevice_VBlankCount != xdk::kUnknown && XDK_CDevice
 // what the library's vertical blank interrupt leaves for the title: count, event, callback
 void VerticalBlank(X86Context& ctx) {
     using clock = std::chrono::steady_clock;
+    constexpr auto kPeriod = std::chrono::microseconds(16667);
     uint32_t info = mem::AllocSystem(12), shown = 0;
-    auto next = clock::now();
+    clock::time_point own_next = clock::now() + kPeriod, ticked_slot;
     for (;;) {
-        next = std::max(next + std::chrono::microseconds(16667), clock::now());
-        std::this_thread::sleep_until(next);
+        // While the title swaps, the blank comes half a frame after the swap's slot in the title's pacing, so a swap
+        // never races a blank: two clocks of the same rate beat, a frame sees no blank and the next two, and a title
+        // that counts blanks times its steps by them. Without a swap the blanks run on their own clock, and a frame
+        // that is late gets its extra blank.
+        auto now = clock::now();
+        clock::time_point slot = app::LastSwapSlot(), due;
+        bool swapping = slot != clock::time_point();
+        if (swapping && slot != ticked_slot && now >= slot + kPeriod / 2) {
+            due = slot + kPeriod / 2;
+            ticked_slot = slot;
+        } else if (now >= own_next) {
+            due = own_next;
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            continue;
+        }
+        // the slack keeps the own clock behind the next swap's blank while the title swaps on time
+        own_next = std::max(due, now - kPeriod) + kPeriod;
+        if (swapping) own_next += std::chrono::milliseconds(2);
         uint32_t count = Dev(XDK_CDevice_VBlankCount) + 1, swaps = Dev(kDevSwapCount);
         SetDev(XDK_CDevice_VBlankCount, count);
         ObjectRef event = FromPointer(kDevice + XDK_CDevice_VBlankEvent);
@@ -927,6 +945,22 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     if (scaled) FilterBackBuffer(g_buffers[0]);
     if (g_backend) g_backend->Present(SurfaceOf(g_aa ? Dev(kDevFrontBuffer) : g_buffers[scaled ? 0 : 1]));
     app::Pace();
+    if (diag::Perf() && kVBlank) {
+        // the vertical blanks the title sees between two swaps: a title that times its frames by them (the library's
+        // count is what the game reads) wants one or two every time, whatever the host's display does
+        using clock = std::chrono::steady_clock;
+        static uint32_t last = 0, hist[5] = {};
+        static clock::time_point report = clock::now();
+        uint32_t count = Dev(XDK_CDevice_VBlankCount);
+        if (last) hist[std::min<uint32_t>(count - last, 4)]++;
+        last = count;
+        if (clock::now() - report >= std::chrono::seconds(1)) {
+            report = clock::now();
+            LOGI("perf: vertical blanks between swaps: 0 x%u, 1 x%u, 2 x%u, 3 x%u, 4+ x%u", hist[0], hist[1], hist[2],
+                 hist[3], hist[4]);
+            std::fill(std::begin(hist), std::end(hist), 0);
+        }
+    }
     if (g_aa) {
         RestoreAfterSwap(ctx);
         return Dev(kDevSwapCount);

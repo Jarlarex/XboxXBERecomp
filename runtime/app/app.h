@@ -1,4 +1,5 @@
 #pragma once
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
@@ -100,5 +101,8 @@ extern const GameInfo kGame;
 
 // sleeps out the rest of the frame for the fps cap
 void Pace();
+// when the title's last swap was due to end (Pace's schedule), nothing before the first swap or after the title stopped
+// swapping for a while (a movie, a load); the vertical blank thread keeps half a frame from it
+std::chrono::steady_clock::time_point LastSwapSlot();
 
 }  // namespace app

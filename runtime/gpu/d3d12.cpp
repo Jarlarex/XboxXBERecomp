@@ -9,6 +9,7 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
+#include <dwmapi.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -662,6 +663,10 @@ private:
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12CommandQueue> queue_;
     ComPtr<IDXGISwapChain3> swap_;
+    HANDLE latency_wait_ = nullptr;  // signaled when the swap chain can take another frame (not ours to close)
+    UINT SwapFlags() const {
+        return (tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0) | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    }
     ComPtr<ID3D12Resource> bb_[kFrames];
     ComPtr<ID3D12Fence> fence_;
     HANDLE event_ = nullptr;
@@ -755,6 +760,8 @@ private:
     std::vector<Query> counted_;  // since the last ClearReport
     std::deque<Report> reports_;
     bool tearing_ = false;
+    UINT sync_interval_ = 1;      // display refreshes a presented frame stays up
+    uint64_t sync_checked_ = 0;   // presents_ when the display's rate was last read
     uint64_t presents_ = 0;
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -823,7 +830,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
-    sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    sd.Flags = SwapFlags();
     ComPtr<IDXGISwapChain1> sc1;
     if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
         LOGE("d3d12: no swap chain");
@@ -831,6 +838,9 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     }
     factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
     sc1.As(&swap_);
+    // one frame in flight: with several queued behind a long sync interval the picture would be that many frames old
+    swap_->SetMaximumFrameLatency(1);
+    latency_wait_ = swap_->GetFrameLatencyWaitableObject();
     return true;
 }
 
@@ -2975,7 +2985,7 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
+    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, SwapFlags());
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -3182,11 +3192,22 @@ void D3D12Backend::CountFps() {
 }
 
 void LogPerf() {
-    static PerfClock::time_point perf_start = PerfClock::now();
-    static uint64_t perf_frames = 0;
+    static PerfClock::time_point perf_start = PerfClock::now(), last_present = perf_start;
+    static uint64_t perf_frames = 0, slow = 0, fast = 0;
+    static double longest = 0;
     perf_frames++;
+    // the time between presents: a steady game shows no slow ones (over 1.25 frames) and no fast ones (under 0.75)
+    double gap = PerfMs(last_present);
+    last_present = PerfClock::now();
+    longest = std::max(longest, gap);
+    slow += gap > 20.8;
+    fast += gap < 12.5;
     double el = PerfMs(perf_start);
     if (el >= 1000.0) {
+        LOGI("perf: present gaps: longest %.1f ms, %llu over 20.8 ms, %llu under 12.5 ms of %llu", longest,
+             (unsigned long long)slow, (unsigned long long)fast, (unsigned long long)perf_frames);
+        longest = 0;
+        slow = fast = 0;
         Perf& p = g_perf;
         double n = double(perf_frames);
         double host = p.draw + p.clear + p.copy + p.present + p.sync;
@@ -3231,13 +3252,32 @@ void D3D12Backend::Present(const Surface& front) {
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
+    if (latency_wait_ && app::Get().vsync) WaitForSingleObjectEx(latency_wait_, 100, TRUE);
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
     Submit(false);
     DeliverReports();
     bool vsync = app::Get().vsync;
+    if (vsync && (!sync_checked_ || presents_ - sync_checked_ >= 120)) {
+        // A display that refreshes a whole number of times per game frame (240 or 120 Hz at a 60 frames cap) takes
+        // the frame for that many refreshes: with one, the title's own pacing picks which refresh a frame lands on and
+        // the frames stay up for uneven times. A rate that is no multiple keeps one and the title's pacing.
+        sync_checked_ = presents_ ? presents_ : 1;
+        UINT n = 1;
+        DWM_TIMING_INFO ti{};
+        ti.cbSize = sizeof(ti);
+        uint32_t cap = app::Get().fps_cap;
+        if (cap && SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateRefresh.uiDenominator) {
+            double hz = double(ti.rateRefresh.uiNumerator) / ti.rateRefresh.uiDenominator, ratio = hz / cap;
+            double whole = std::round(ratio);
+            if (whole >= 1 && std::fabs(ratio - whole) < 0.01 * whole) n = UINT(whole);
+        }
+        if (n != sync_interval_)
+            LOGI("d3d12: %u display refresh%s a frame (display rate over the %u fps cap)", n, n == 1 ? "" : "es", cap);
+        sync_interval_ = n;
+    }
     auto perf_swap = PerfClock::now();
-    swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
+    swap_->Present(vsync ? sync_interval_ : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
 
     presents_++;
