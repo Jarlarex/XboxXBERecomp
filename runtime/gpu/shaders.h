@@ -104,6 +104,7 @@ struct DrawConstants {
     float ssf[4];        // D3D's scaling of screen space vertices onto the grid, x and y (State::ss_x, ss_y)
     float stip[4];       // host pixels per pixel of the target's grid, which the stipple pattern repeats over
     uint32_t stipple[32];  // the pattern's rows
+    float zclip[4];      // the depth clip planes the title set (State::zplanes), near and far, and 1 while they clip
 };
 
 }  // namespace gpu

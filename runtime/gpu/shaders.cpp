@@ -32,6 +32,7 @@ struct VOut {
     float4 tc2 : TEXCOORD2;
     float4 tc3 : TEXCOORD3;
     float fogamt : TEXCOORD4;
+    float2 clip : SV_ClipDistance0;
 };
 cbuffer VC : register(b0) { float4 c[192]; };
 cbuffer DC : register(b1) {
@@ -57,6 +58,7 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 ssf;
     float4 stip;
     uint4 stipple[8];
+    float4 zclip;
 };
 )";
 
@@ -244,6 +246,8 @@ const char* kVsEpilogue = R"(
     o.tc2 = oT2;
     o.tc3 = oT3;
     o.fogamt = fogfactor(oFog.x);
+    // the depth clip planes, in depth buffer units: what lies past them is clipped, as against 0 and w by default
+    o.clip = zclip.z > 0 ? float2(p.z - zclip.x, zclip.y - p.z) * p.w : 1;
     return o;
 }
 )";
@@ -859,6 +863,8 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
     o.tc2 = oT2;
     o.tc3 = oT3;
     o.fogamt = fogfactor(abs(cp.z));
+    // the depth clip planes, in depth buffer units, against the depth the viewport's 0 to 1 gives
+    o.clip = zclip.z > 0 ? float2(cp.z / surf.z - zclip.x * cp.w, zclip.y * cp.w - cp.z / surf.z) : 1;
     return o;
 }
 )";
