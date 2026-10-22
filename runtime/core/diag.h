@@ -45,4 +45,14 @@ inline double CaptureEvery() {
     return seconds;
 }
 
+// XBE_CAPTURE_STEP: in a capture, the bound render target is also saved after every this many draws, to see what each
+// draw added; 0 or unset: never
+inline unsigned CaptureStep() {
+    static const unsigned n = [] {
+        const char* v = std::getenv("XBE_CAPTURE_STEP");
+        return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
+    }();
+    return n;
+}
+
 }  // namespace diag
