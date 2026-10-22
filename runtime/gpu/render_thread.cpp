@@ -42,7 +42,7 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
 enum class Op : uint8_t {
-    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Overlay
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Overlay, Filter
 };
 
 struct Cmd {
@@ -174,6 +174,18 @@ public:
         Use(dst.header);
         Written(dst);
         g_perf_capture_ns += Ns(t);
+    }
+
+    void Filter(const Surface& src, const Surface& dst) override {
+        Cmd c{Op::Filter};
+        c.s1 = src;
+        c.s1.header = Header(src.header);
+        c.s2 = dst;
+        c.s2.header = Header(dst.header);
+        cur_->cmds.push_back(c);
+        Use(src.header);
+        Use(dst.header);
+        Written(dst);
     }
 
     void Present(const Surface& front) override {
@@ -444,6 +456,7 @@ private:
             case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
+            case Op::Filter: inner_->Filter(c.s1, c.s2); break;
             case Op::Present: inner_->Present(c.s1); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;

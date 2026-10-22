@@ -24,6 +24,7 @@ struct Overlay {
     int32_t dst[4] = {};
     bool color_key = false;  // show the overlay only where the frame holds key
     uint32_t key = 0;
+    uint32_t display_w = 0, display_h = 0;  // the front buffers' size, which dst is in; 0 for the frame's
 };
 
 class Backend {
@@ -39,6 +40,8 @@ public:
     virtual void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects_va,
                       uint32_t dst_points_va) = 0;
     virtual void Present(const Surface& front) = 0;
+    // Swap's filter on a multisampled device: src (the back buffer) scaled into dst (a front buffer), linearly
+    virtual void Filter(const Surface& /*src*/, const Surface& /*dst*/) {}
     // the CPU is about to touch this resource's memory: write GPU results back first
     virtual void Sync(uint32_t data_va, uint32_t size) = 0;
     // a lock that does not wait for the GPU (NOOVERWRITE): a result a frame or two old is what the console gives too
