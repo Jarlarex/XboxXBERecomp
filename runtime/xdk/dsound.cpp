@@ -257,6 +257,8 @@ struct Voice {
     uint8_t input_bin = kNoInput;
     std::vector<float> input;
     float input_peak = 0;
+    // the loudest sample read from the voice's data and the loudest it added to a bin, since the last verbose report
+    float source_peak = 0, mixed_peak = 0;
     Gains gain = {};  // the last block's gains, the next block ramps from them
     bool has_gain = false;
     // a mono 3D voice's interaural delay in samples and its recent samples
@@ -801,6 +803,7 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
                 if (!(read >> c & 1)) continue;
                 float x = Sample(v, cursor->data, cursor->f, int(c));
                 row[c] = x + (Sample(v, cursor->next_data, cursor->next_f, int(c)) - x) * t;
+                v.source_peak = std::max(v.source_peak, std::fabs(row[c]));
             }
             v.pos += rate;
         }
@@ -814,6 +817,7 @@ void MixVoice(Voice& v, float* bins, uint32_t frames) {
         for (Lane& lane : lanes) {
             lane.gain += lane.step;
             float x = row[lane.row] * lane.gain;
+            v.mixed_peak = std::max(v.mixed_peak, std::fabs(x));
             if (send && lane.bin == kMultipassBin) {
                 send[i] += x;
             } else {
@@ -989,7 +993,8 @@ void SetData3d(Voice& v, uint32_t data) {
     }
 }
 
-// verbose: every few seconds, the 3D data of the voices playing with it and what each submix takes in
+// verbose: every few seconds, the 3D data of the voices playing with it, what each submix takes in, and the streams
+// playing without 3D data (music, movies) with the loudest samples they read and added
 void ReportMix() {
     static int64_t next = 0;
     int64_t now = NowMs();
@@ -999,6 +1004,11 @@ void ReportMix() {
     g_out_peak = 0;
     for (auto& [obj, v] : g_voices) {
         const Data3d* d = Data3dOf(v);
+        if (v.stream && v.active && !d && !IsSubmix(v)) {
+            LOGI("dsound: stream %08X (flags %X, %u channels, %u Hz, tag %X): source peak %.3f, mixed peak %.3f", obj,
+                 v.flags, v.channels, v.freq ? v.freq : v.rate, v.tag, v.source_peak, v.mixed_peak);
+        }
+        v.source_peak = v.mixed_peak = 0;
         uint32_t sources = 0;
         if (IsSubmix(v)) {
             for (auto& [other, source] : g_voices) sources += source.output == obj;
