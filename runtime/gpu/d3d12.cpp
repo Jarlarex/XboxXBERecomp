@@ -94,6 +94,7 @@ struct Perf {
     uint64_t shaders = 0;
     uint64_t raw = 0;
     uint64_t lates = 0;
+    uint64_t fetches = 0;
 };
 Perf g_perf;
 struct PerfScope {
@@ -377,6 +378,18 @@ std::vector<uint8_t> BlueBytes(const uint8_t* px, size_t src_pitch, uint32_t w, 
     return out;
 }
 
+// a read-back's BGRA rows, row_pitch apart, into guest memory at dst in a target's guest layout
+void WriteGuestRows(uint8_t* dst, const uint8_t* p, uint32_t row_pitch, uint32_t gw, uint32_t gh, uint32_t pitch,
+                    uint8_t texel) {
+    if (texel == 4) {
+        for (uint32_t y = 0; y < gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * row_pitch, size_t(gw) * 4);
+        return;
+    }
+    for (uint32_t y = 0; y < gh; y++) {
+        for (uint32_t x = 0; x < gw; x++) dst[size_t(y) * pitch + x] = p[size_t(y) * row_pitch + x * 4];
+    }
+}
+
 // a lock alone proves nothing, reads lock too: only changed bytes mean the CPU wrote it
 bool LatchCpuWrite(Target& t) {
     uint64_t e = DirtyEpoch(t.data);
@@ -493,6 +506,9 @@ public:
     void SyncLate(uint32_t data) override;
     bool DeliverLate(uint32_t data) override;
     void RecordLate(uint32_t data) override;
+    bool Fetching(uint32_t data) override;
+    void StartFetch(uint32_t data) override;
+    bool Fetched(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
     void SetOverlay(const Overlay& overlay) override;
@@ -799,6 +815,18 @@ private:
     };
     std::unordered_map<uint32_t, Late> late_;
     std::mutex late_lock_;                      // DeliverLate runs on the title's thread
+    // IsBusy's copies of drawn surfaces on their way to guest memory, by data address
+    struct Fetch {
+        ComPtr<ID3D12Resource> rb;
+        uint64_t bytes = 0;    // rb's size
+        uint64_t fence = 0;    // made once the GPU is past it
+        uint32_t gw = 0, gh = 0, pitch = 0, row_pitch = 0;
+        uint8_t texel = 4;
+        bool pending = false;  // started, not written yet
+        bool copied = false;   // a copy was recorded; without one there is nothing to write
+    };
+    std::unordered_map<uint32_t, Fetch> fetches_;
+    std::mutex fetch_lock_;                     // Fetched runs on the title's thread
     std::atomic<uint64_t> presents_seen_{0};    // presents_ for DeliverLate
     Assembled asm_;  // kept between draws for its buffers
     // visibility tests: an occlusion query per counted draw, summed into report memory once the GPU is done
@@ -3360,10 +3388,10 @@ void LogPerf() {
              g_perf_sync_late.exchange(0) / n);
         LOGI("perf: per frame %.0f draws (%.0f raw) %.0fk verts %.1f MB upload %.1f overflow | %.0f checks %.2f MB "
              "hashed | %.1f tex uploads %.2f MB, %.1f new tex, %.1f new targets, %.1f target uploads, %.1f shrinks, "
-             "%.1f read-backs %.1f late | %llu shaders %llu psos this second",
+             "%.1f read-backs %.1f late %.1f fetched | %llu shaders %llu psos this second",
              p.draws / n, p.raw / n, p.verts / n / 1000.0, p.upload / n / 1048576.0, p.overflow / n, p.sigs / n,
              p.sig_bytes / n / 1048576.0, p.texups / n, p.texup_bytes / n / 1048576.0, p.newtex / n,
-             p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n,
+             p.targets / n, p.rtups / n, p.shrinks / n, p.syncs / n, p.lates / n, p.fetches / n,
              (unsigned long long)p.shaders, (unsigned long long)p.psos);
         g_perf = Perf{};
         perf_start = PerfClock::now();
@@ -3532,14 +3560,7 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
         // the last row is not padded to the pitch: a range to the end of the pitch fails to map
         D3D12_RANGE rr{0, size_t(l.row_pitch) * (l.gh - 1) + l.gw * 4};
         if (FAILED(l.rb[best]->Map(0, &rr, reinterpret_cast<void**>(&p)))) return false;
-        uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
-        if (l.texel == 4) {
-            for (uint32_t y = 0; y < l.gh; y++)
-                std::memcpy(dst + size_t(y) * l.pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
-        } else {
-            std::vector<uint8_t> px = BlueBytes(p, l.row_pitch, l.gw, l.gh);
-            for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * l.pitch, &px[size_t(y) * l.gw], l.gw);
-        }
+        WriteGuestRows(static_cast<uint8_t*>(kernel::HostPtr(data)), p, l.row_pitch, l.gw, l.gh, l.pitch, l.texel);
         D3D12_RANGE none{0, 0};
         l.rb[best]->Unmap(0, &none);
         l.delivered = l.fence[best];
@@ -3619,6 +3640,86 @@ void D3D12Backend::RecordLate(uint32_t data) {
     ID3D12Resource* src = PrepareLateSource(t, l);
     if (!src) return;
     RecordLateCopy(l, slot, src);
+}
+
+// without the render thread: a drawn surface is copied now and stays busy until the copy is made
+bool D3D12Backend::Fetching(uint32_t data) {
+    bool pending;
+    {
+        std::lock_guard lock(fetch_lock_);
+        auto f = fetches_.find(data);
+        pending = f != fetches_.end() && f->second.pending;
+    }
+    if (pending) return !Fetched(data);
+    auto it = targets_.find(TargetMapKey(data, false));
+    if (it == targets_.end() || !it->second.drawn || TargetStale(data)) return false;
+    StartFetch(data);
+    return true;
+}
+
+void D3D12Backend::StartFetch(uint32_t data) {
+    std::lock_guard lock(fetch_lock_);
+    Fetch& f = fetches_[data];
+    f.pending = true;
+    f.copied = false;
+    auto it = targets_.find(TargetMapKey(data, false));
+    if (it == targets_.end() || TargetStale(data)) return;
+    Target& t = it->second;
+    CopySource src = PrepareCopySource(t, {});
+    if (!src.res) return;
+    D3D12_RESOURCE_DESC rd = src.res->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows;
+    UINT64 row_size;
+    UINT64 bytes;
+    dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
+    if (!f.rb || f.bytes != bytes) {
+        if (f.rb) CurrentFrame().garbage.push_back(f.rb);
+        f.rb = nullptr;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+        D3D12_RESOURCE_DESC bd = BufferDesc(bytes);
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&f.rb)))) {
+            return;
+        }
+        f.bytes = bytes;
+    }
+    D3D12_TEXTURE_COPY_LOCATION dl{f.rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dl.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION sl{src.res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    if (src.down) CurrentFrame().garbage.push_back(src.down);
+    g_perf.fetches++;
+    f.fence = fence_value_ + 1;  // the next Submit carries it
+    f.gw = t.gw;
+    f.gh = t.gh;
+    f.pitch = t.pitch;
+    f.texel = t.texel;
+    f.row_pitch = fp.Footprint.RowPitch;
+    f.copied = true;
+    // the copy holds every draw so far, and what Fetched writes is no CPU change to upload back
+    t.drawn = false;
+    t.read.clear();
+}
+
+bool D3D12Backend::Fetched(uint32_t data) {
+    std::lock_guard lock(fetch_lock_);
+    auto it = fetches_.find(data);
+    if (it == fetches_.end() || !it->second.pending) return true;
+    Fetch& f = it->second;
+    if (f.copied) {
+        if (f.fence > fence_->GetCompletedValue()) return false;
+        uint8_t* p = nullptr;
+        // the last row is not padded to the pitch: a range to the end of the pitch fails to map
+        D3D12_RANGE rr{0, size_t(f.row_pitch) * (f.gh - 1) + f.gw * 4};
+        if (SUCCEEDED(f.rb->Map(0, &rr, reinterpret_cast<void**>(&p)))) {
+            WriteGuestRows(static_cast<uint8_t*>(kernel::HostPtr(data)), p, f.row_pitch, f.gw, f.gh, f.pitch, f.texel);
+            D3D12_RANGE none{0, 0};
+            f.rb->Unmap(0, &none);
+        }
+    }
+    f.pending = false;
+    return true;
 }
 
 // filters src into a new w x h target, left as a copy source

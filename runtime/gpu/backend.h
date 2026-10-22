@@ -51,6 +51,13 @@ public:
     // false when there is none recent; RecordLate (in order with the draws) starts a copy for a later lock
     virtual bool DeliverLate(uint32_t) { return false; }
     virtual void RecordLate(uint32_t) {}
+    // IsBusy's read-back of a surface the GPU drew, which never waits on the GPU. Fetching (the title's thread): true
+    // while one is on its way; the first call after a draw starts it, the call that finds it made has written it to
+    // guest memory. In two for the render thread: StartFetch (in order with the draws) copies what is drawn so far,
+    // Fetched (any thread) writes the copy once the GPU has made it, false until then.
+    virtual bool Fetching(uint32_t /*data*/) { return false; }
+    virtual void StartFetch(uint32_t) {}
+    virtual bool Fetched(uint32_t) { return true; }
     virtual void Flush() = 0;
     virtual void SetGamma(const uint8_t* ramp /*3 x 256*/) = 0;
     // the overlay shown from the next present on
