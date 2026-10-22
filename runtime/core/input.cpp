@@ -39,14 +39,48 @@ std::mutex g_lock;
 bool g_sdl = false;
 SDL_Gamepad* g_pads[4] = {};
 
+// The console's motors run until they are set again. SDL resends a rumble every 2 s while it lasts, for pads that stop
+// one on their own after a few seconds (the DualShock 4), but only a rumble with a duration: each gets the longest
+// SDL takes, renewed at half of it while the title leaves the motors running.
+constexpr uint32_t kRumbleMs = 0xFFFF;  // SDL_MAX_RUMBLE_DURATION_MS
+struct Motors {
+    uint16_t left = 0, right = 0;
+    uint64_t renewed = 0;  // SDL_GetTicks
+};
+Motors g_motors[4];
+
+// SDL's driver for a controller, from its GUID's signature byte (SDL_joystick.c, SDL_IsJoystickHIDAPI and friends)
+const char* DriverName(SDL_GUID guid) {
+    switch (guid.data[14]) {
+        case 'h': return "HIDAPI";
+        case 'w': return "Windows.Gaming.Input";
+        case 'g': return "GameInput";
+        case 'r': return "RawInput";
+        case 'x': return "XInput";
+        case 'm': return "MFi";
+        case 'v': return "virtual";
+        default: return "other driver";
+    }
+}
+
 void AddPad(SDL_JoystickID id) {
     for (SDL_Gamepad* pad : g_pads)
         if (pad && SDL_GetGamepadID(pad) == id) return;
     SDL_Gamepad** slot = std::find(std::begin(g_pads), std::end(g_pads), nullptr);
     if (slot == std::end(g_pads)) return;
     *slot = SDL_OpenGamepad(id);
-    const char* name = *slot ? SDL_GetGamepadName(*slot) : SDL_GetError();
-    LOGI("input: controller %d %s: %s", int(slot - g_pads) + 1, *slot ? "plugged in" : "failed to open", name ? name : "");
+    int port = int(slot - g_pads) + 1;
+    if (!*slot) {
+        LOGI("input: controller %d failed to open: %s", port, SDL_GetError());
+        return;
+    }
+    const char* name = SDL_GetGamepadName(*slot);
+    SDL_JoystickConnectionState link = SDL_GetGamepadConnectionState(*slot);
+    SDL_PropertiesID props = SDL_GetGamepadProperties(*slot);
+    LOGI("input: controller %d plugged in: %s (%04X:%04X, %s, %s, %s)", port, name ? name : "",
+         SDL_GetGamepadVendor(*slot), SDL_GetGamepadProduct(*slot), DriverName(SDL_GetGamepadGUIDForID(id)),
+         link == SDL_JOYSTICK_CONNECTION_WIRED ? "wired" : link == SDL_JOYSTICK_CONNECTION_WIRELESS ? "wireless" : "link unknown",
+         SDL_GetBooleanProperty(props, SDL_PROP_GAMEPAD_CAP_RUMBLE_BOOLEAN, false) ? "rumble" : "no rumble");
 }
 
 void RemovePad(SDL_JoystickID id) {
@@ -233,7 +267,12 @@ void AddKeyboard(Pad& p) {
     p.connected = true;
 #ifdef _WIN32
     HWND window = static_cast<HWND>(app::Window());
-    if (!window || GetForegroundWindow() != window) return;
+    bool focus = window && GetForegroundWindow() == window;
+    static std::atomic<int> had_focus{-1};
+    if (had_focus.exchange(focus) != int(focus))
+        LOGI(focus ? "input: the keyboard plays in port 1 (the game window has the focus)"
+                   : "input: the keyboard is off (another window has the focus)");
+    if (!focus) return;
     auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
     // D-pad up, down, left, right, start, back
     constexpr int kButtons[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE, VK_TAB};
@@ -264,6 +303,13 @@ void UpdatePads() {
     while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) == 1) {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
+    }
+    for (int i = 0; i < 4; i++) {
+        Motors& m = g_motors[i];
+        if (g_pads[i] && (m.left || m.right) && now - m.renewed >= kRumbleMs / 2) {
+            SDL_RumbleGamepad(g_pads[i], m.left, m.right, kRumbleMs);
+            m.renewed = now;
+        }
     }
 }
 
@@ -355,11 +401,15 @@ uint16_t HeldOnAnyController() {
     return held;
 }
 
-// the motors run until set again
+// the speeds reach SDL unscaled; a scripted run ignores the physical controllers, and leaves their motors alone too
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
     std::lock_guard lock(g_lock);
-    if (port >= 0 && port < 4 && g_pads[port]) SDL_RumbleGamepad(g_pads[port], left, right, 0);
+    if (port < 0 || port >= 4) return;
+    g_motors[port] = {left, right, SDL_GetTicks()};
+    if (g_scripted || !g_pads[port]) return;
+    if (!SDL_RumbleGamepad(g_pads[port], left, right, kRumbleMs))
+        LOG_FIRST(4, "input: rumble on controller %d failed: %s", port + 1, SDL_GetError());
 }
 
 }  // namespace input
