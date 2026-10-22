@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <cctype>
 #include <chrono>
 #include <cstdio>
@@ -1349,7 +1350,22 @@ KERNEL_EXPORT(339, XcRC4Crypt, 3) {
     crypto::Rc4Crypt(HostPtr(a[0]), static_cast<uint8_t*>(HostPtr(a[2])), a[1]);
     return 0;
 }
-KERNEL_EXPORT(346, XcDESKeyParity, 2) { return 0; }
+// (key, length): every byte gets odd parity in its low bit, as DES keys carry it
+KERNEL_EXPORT(346, XcDESKeyParity, 2) {
+    uint8_t* key = static_cast<uint8_t*>(HostPtr(a[0]));
+    for (uint32_t i = 0; i < a[1]; i++) {
+        uint8_t high = key[i] & 0xFE;
+        key[i] = high | uint8_t(!(std::popcount(high) & 1));
+    }
+    return 0;
+}
+// A public key starts with the BSAFE header: "RSA1", the modulus buffer's length in bytes (the bits / 8 plus 8,
+// 264 for the 2048 bit XePublicKeyData), the bits, the most data bytes and the exponent; the length sizes the
+// buffers XcPKEncPublic and XcVerifyPKCS1Signature take. Only the online stack asks.
+KERNEL_EXPORT(343, XcPKGetKeyLen, 1) {
+    constexpr uint32_t kRsa1 = 0x31415352;
+    return R32(a[0]) == kRsa1 ? R32(a[0] + 4) : 0;
+}
 KERNEL_EXPORT(347, XcKeyTable, 3) { return 0; }
 KERNEL_EXPORT(349, XcBlockCryptCBC, 7) {
     // only the online stack encrypts with DES; plain copy keeps buffers defined
