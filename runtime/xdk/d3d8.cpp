@@ -944,7 +944,9 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     bool scaled = !g_aa && (g_scale_x != 1 || g_scale_y != 1);
     if (scaled) FilterBackBuffer(g_buffers[0]);
     if (g_backend) g_backend->Present(SurfaceOf(g_aa ? Dev(kDevFrontBuffer) : g_buffers[scaled ? 0 : 1]));
-    app::Pace();
+    // D3DRS_PRESENTATIONINTERVAL: the vertical blanks a frame stays up, 0x80000000 set for "or immediately when late"
+    uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4) & 0xFF;
+    app::Pace(interval);
     if (diag::Perf() && kVBlank) {
         // the vertical blanks the title sees between two swaps: a title that times its frames by them (the library's
         // count is what the game reads) wants one or two every time, whatever the host's display does

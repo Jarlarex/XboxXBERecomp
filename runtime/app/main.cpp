@@ -220,6 +220,7 @@ uint32_t RefreshRate() {
 }
 
 std::atomic<int64_t> g_swap_slot{0};  // steady_clock ticks, 0 before the first swap
+std::atomic<uint32_t> g_target_fps{0};
 
 }  // namespace
 
@@ -229,7 +230,9 @@ std::chrono::steady_clock::time_point LastSwapSlot() {
     return clock::now() - slot > std::chrono::milliseconds(100) ? clock::time_point() : slot;
 }
 
-void Pace() {
+uint32_t TargetFps() { return g_target_fps; }
+
+void Pace(uint32_t interval) {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
@@ -237,13 +240,18 @@ void Pace() {
     // refresh
     constexpr uint32_t kRefreshMargin = 3;
     if (cap == kFpsCapRefresh) cap = RefreshRate() > kRefreshMargin ? RefreshRate() - kRefreshMargin : 0;
+    // a title that holds its frames for blanks runs at the console's rate, under any cap above it (Forza Motorsport
+    // asks for two, 30 frames a second, also with the cap at the refresh rate)
+    uint32_t held = interval > 1 ? 60 / interval : 0;  // the console's blanks are 60 a second
+    uint32_t fps = held ? (cap ? std::min(cap, held) : held) : cap;
+    g_target_fps = fps;
     auto now = clock::now();
-    if (!cap) {
+    if (!fps) {
         next = now;
         g_swap_slot = 0;  // no schedule to keep the blanks to: they run on their own clock
         return;
     }
-    auto period = std::chrono::nanoseconds(1000000000ull / cap);
+    auto period = std::chrono::nanoseconds(1000000000ull / fps);
     next += period;
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);

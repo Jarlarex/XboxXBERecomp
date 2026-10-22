@@ -3196,14 +3196,14 @@ void LogPerf() {
     static double longest = 0;
     perf_frames++;
     // the time between presents: a steady game shows no slow ones (over 1.25 frames) and no fast ones (under 0.75)
-    double gap = PerfMs(last_present);
+    double gap = PerfMs(last_present), frame = app::TargetFps() ? 1000.0 / app::TargetFps() : 16.667;
     last_present = PerfClock::now();
     longest = std::max(longest, gap);
-    slow += gap > 20.8;
-    fast += gap < 12.5;
+    slow += gap > frame * 1.25;
+    fast += gap < frame * 0.75;
     double el = PerfMs(perf_start);
     if (el >= 1000.0) {
-        LOGI("perf: present gaps: longest %.1f ms, %llu over 20.8 ms, %llu under 12.5 ms of %llu", longest,
+        LOGI("perf: present gaps: longest %.1f ms, %llu over 1.25 frames, %llu under 0.75 of %llu", longest,
              (unsigned long long)slow, (unsigned long long)fast, (unsigned long long)perf_frames);
         longest = 0;
         slow = fast = 0;
@@ -3263,7 +3263,7 @@ void D3D12Backend::Present(const Surface& front) {
         // the frames stay up for uneven times. A rate that is no multiple keeps one and the title's pacing.
         sync_checked_ = presents_ ? presents_ : 1;
         UINT n = 1;
-        uint32_t cap = app::Get().fps_cap;
+        uint32_t cap = app::TargetFps();
         // the rate of the monitor the window is on (DWM reports the primary monitor's; on a hybrid laptop the swap
         // chain's own adapter may not drive that monitor at all)
         HWND hwnd = static_cast<HWND>(app::Window());
@@ -3274,7 +3274,8 @@ void D3D12Backend::Present(const Surface& front) {
         if (cap && hwnd && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
             EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
             double ratio = double(dm.dmDisplayFrequency) / cap, whole = std::round(ratio);
-            if (whole >= 1 && std::fabs(ratio - whole) < 0.01 * whole) n = UINT(whole);
+            // DXGI holds a frame for 4 refreshes at most; a slower game's frame then stays up until the next one
+            if (whole >= 1 && std::fabs(ratio - whole) < 0.01 * whole) n = std::min<UINT>(UINT(whole), 4);
         }
         if (n != sync_interval_)
             LOGI("d3d12: %u display refresh%s a frame (display %u Hz, cap %u fps)", n, n == 1 ? "" : "es",
