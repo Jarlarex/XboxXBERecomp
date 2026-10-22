@@ -2,6 +2,8 @@
 #include "core/input.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -46,16 +48,67 @@ void RemovePad(SDL_JoystickID id) {
 
 // XBE_INPUT_SCRIPT: timed presses on a scripted controller in port 1 for unattended runs, "seconds:button[:held]"
 // separated by commas, e.g. "30:start,33:a:0.2" (held defaults to 0.15 s). Buttons: up down left right start back ls
-// rs a b x y black white lt rt. With a script, physical controllers are ignored, so a pad in use elsewhere cannot
-// steer the run.
+// rs a b x y black white lt rt. A stick axis is "seconds:axis=value[:held]" with the axis lx, ly, rx or ry and a
+// value from -1 to 1 (x right, y up), e.g. "40:lx=-0.5:2" steers left at half deflection for 2 s; where axis
+// entries overlap, the one that started last wins. "seconds:wait=text[:timeout]" (up to 64) holds the script's clock
+// at that time until a log line containing text (any case, no commas or colons) has been written since the script
+// began, or the timeout (default 120 s) passes: "30:wait=UserProfile.xml,32:a" presses A two seconds after the game
+// opens the profile, however long loading takes. "text*3" waits for the third such line. With a script, physical controllers are ignored, so a pad in use
+// elsewhere cannot steer the run.
 struct Press {
     double at, until;
     uint16_t buttons;   // Pad::buttons bits
     uint8_t analog;     // Pad::analog index + 1, 0 for none
+    uint8_t axis;       // stick axis: 1 lx, 2 ly, 3 rx, 4 ry, 0 for none
+    int16_t value;
+};
+struct Wait {
+    double at, timeout;
+    std::string text;   // lower case
+    int need;           // lines with the text before the wait passes
 };
 std::vector<Press> g_script;
+std::vector<Wait> g_waits;  // by at
 bool g_scripted = false;
 uint64_t g_script_start = 0;
+
+// the script's clock stops at a wait until a line with its text has been logged (a line logged since the script began
+// counts, so a wait for something the game has already done passes at once); the state is guarded by g_script_lock,
+// except that the log observer, which runs on whichever thread logs, only reads g_waits and counts into g_heard
+constexpr size_t kMaxWaits = 64;
+std::atomic<int> g_heard[kMaxWaits];  // lines logged with wait i's text
+std::mutex g_script_lock;
+size_t g_wait_next = 0;       // the first wait the clock has not passed
+double g_held_total = 0;      // seconds the clock has been held
+double g_hold_began = -1;     // real seconds when the open wait began, -1 when none is open
+
+void OnLog(const char* message) {
+    std::string line = message;
+    for (char& c : line) c = char(std::tolower(static_cast<unsigned char>(c)));
+    for (size_t i = 0; i < g_waits.size(); i++)
+        if (line.find(g_waits[i].text) != std::string::npos) g_heard[i]++;
+}
+
+double ScriptTime() {
+    std::lock_guard lock(g_script_lock);
+    double real = double(SDL_GetTicks() - g_script_start) / 1000.0;
+    for (;;) {
+        double now = real - g_held_total;
+        if (g_wait_next >= g_waits.size()) return now;
+        const Wait& w = g_waits[g_wait_next];
+        if (g_hold_began < 0) {
+            if (now < w.at) return now;
+            g_hold_began = real - (now - w.at);
+        }
+        bool heard = g_heard[g_wait_next] >= w.need;
+        bool timed_out = real - g_hold_began >= w.timeout;
+        if (!heard && !timed_out) return w.at;
+        g_held_total += real - g_hold_began;
+        g_hold_began = -1;
+        g_wait_next++;
+        if (!heard) LOGW("input: no log line with \"%s\" in %.0f s, going on", w.text.c_str(), w.timeout);
+    }
+}
 
 void LoadScript() {
     const char* env = std::getenv("XBE_INPUT_SCRIPT");
@@ -63,35 +116,73 @@ void LoadScript() {
     static const std::pair<const char*, int> kNames[] = {
         {"up", 0}, {"down", 1}, {"left", 2}, {"right", 3}, {"start", 4}, {"back", 5}, {"ls", 6}, {"rs", 7},
         {"a", 8}, {"b", 9}, {"x", 10}, {"y", 11}, {"black", 12}, {"white", 13}, {"lt", 14}, {"rt", 15}};
+    static const char* kAxes[] = {"lx", "ly", "rx", "ry"};
     std::string all = env;
     size_t pos = 0;
     while (pos <= all.size()) {
         size_t end = all.find(',', pos);
         std::string item = all.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
         pos = end == std::string::npos ? all.size() + 1 : end + 1;
-        double at = 0, held = 0.15;
+        double at = 0, held = 0.15, value = 0;
         char name[16] = {};
+        if (size_t colon = item.find(':'); colon != std::string::npos && item.compare(colon + 1, 5, "wait=") == 0) {
+            std::string text = item.substr(colon + 6);
+            double timeout = 120;
+            if (size_t sep = text.find(':'); sep != std::string::npos) {
+                timeout = std::atof(text.c_str() + sep + 1);
+                text.resize(sep);
+            }
+            int need = 1;
+            if (size_t star = text.rfind('*'); star != std::string::npos) {
+                need = std::max(std::atoi(text.c_str() + star + 1), 1);
+                text.resize(star);
+            }
+            for (char& c : text) c = char(std::tolower(static_cast<unsigned char>(c)));
+            if (!text.empty() && g_waits.size() < kMaxWaits && std::sscanf(item.c_str(), "%lf", &at) == 1)
+                g_waits.push_back({at, timeout, text, need});
+            continue;
+        }
+        if (std::sscanf(item.c_str(), "%lf:%2[a-z]=%lf:%lf", &at, name, &value, &held) >= 3) {
+            for (int i = 0; i < 4; i++) {
+                if (std::strcmp(kAxes[i], name) != 0) continue;
+                int16_t v = int16_t(std::clamp(value, -1.0, 1.0) * 32767.0);
+                g_script.push_back({at, at + held, 0, 0, uint8_t(i + 1), v});
+            }
+            continue;
+        }
+        held = 0.15;
         int n = std::sscanf(item.c_str(), "%lf:%15[a-z]:%lf", &at, name, &held);
         if (n < 2) continue;
         for (auto [label, index] : kNames) {
             if (std::strcmp(label, name) != 0) continue;
-            Press press{at, at + held, 0, 0};
+            Press press{at, at + held, 0, 0, 0, 0};
             if (index < 8) press.buttons = uint16_t(1 << index);
             else press.analog = uint8_t(index - 8 + 1);
             g_script.push_back(press);
         }
     }
+    std::stable_sort(g_waits.begin(), g_waits.end(), [](const Wait& a, const Wait& b) { return a.at < b.at; });
+    if (!g_waits.empty()) logx::SetObserver(OnLog);
     g_scripted = true;
     g_script_start = SDL_GetTicks();
-    LOGI("input: scripted controller in port 1, %zu presses; physical controllers ignored", g_script.size());
+    LOGI("input: scripted controller in port 1, %zu presses, %zu waits; physical controllers ignored", g_script.size(),
+         g_waits.size());
 }
 
 Pad ScriptedPad() {
     Pad p;
     p.connected = true;
-    double now = double(SDL_GetTicks() - g_script_start) / 1000.0;
+    double now = ScriptTime();
+    double started[4] = {-1, -1, -1, -1};
     for (const Press& press : g_script) {
         if (now < press.at || now >= press.until) continue;
+        if (press.axis) {
+            int16_t* sticks[4] = {&p.lx, &p.ly, &p.rx, &p.ry};
+            if (press.at < started[press.axis - 1]) continue;
+            started[press.axis - 1] = press.at;
+            *sticks[press.axis - 1] = press.value;
+            continue;
+        }
         p.buttons |= press.buttons;
         if (press.analog) p.analog[press.analog - 1] = 0xFF;
     }
