@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -50,10 +51,11 @@ void RemovePad(SDL_JoystickID id) {
 // separated by commas, e.g. "30:start,33:a:0.2" (held defaults to 0.15 s). Buttons: up down left right start back ls
 // rs a b x y black white lt rt. A stick axis is "seconds:axis=value[:held]" with the axis lx, ly, rx or ry and a
 // value from -1 to 1 (x right, y up), e.g. "40:lx=-0.5:2" steers left at half deflection for 2 s; where axis
-// entries overlap, the one that started last wins. "seconds:wait=text[:timeout]" (up to 64) holds the script's clock
-// at that time until a log line containing text (any case, no commas or colons) has been written since the script
-// began, or the timeout (default 120 s) passes: "30:wait=UserProfile.xml,32:a" presses A two seconds after the game
-// opens the profile, however long loading takes. "text*3" waits for the third such line. With a script, physical controllers are ignored, so a pad in use
+// entries overlap, the one that started last wins. "seconds:wait=text[:timeout[:button]]" (up to 64) holds the
+// script's clock at that time until a log line containing text (any case, no commas or colons) has been written since
+// the script began, or the timeout (default 120 s) passes: "30:wait=UserProfile.xml,32:a" presses A two seconds after
+// the game opens the profile, however long loading takes. "text*3" waits for the third such line. With a button, the
+// hold presses it for 0.15 s every 1.5 s, for a screen that takes the first press only when it is ready. With a script, physical controllers are ignored, so a pad in use
 // elsewhere cannot steer the run.
 struct Press {
     double at, until;
@@ -66,6 +68,7 @@ struct Wait {
     double at, timeout;
     std::string text;   // lower case
     int need;           // lines with the text before the wait passes
+    Press repeat;       // pressed now and then while the wait is open, buttons and analog 0 for none
 };
 std::vector<Press> g_script;
 std::vector<Wait> g_waits;  // by at
@@ -89,9 +92,11 @@ void OnLog(const char* message) {
         if (line.find(g_waits[i].text) != std::string::npos) g_heard[i]++;
 }
 
-double ScriptTime() {
+// the script's clock; the open wait's repeating press while its pulse is on goes to *pulse
+double ScriptTime(const Press** pulse) {
     std::lock_guard lock(g_script_lock);
     double real = double(SDL_GetTicks() - g_script_start) / 1000.0;
+    *pulse = nullptr;
     for (;;) {
         double now = real - g_held_total;
         if (g_wait_next >= g_waits.size()) return now;
@@ -102,7 +107,10 @@ double ScriptTime() {
         }
         bool heard = g_heard[g_wait_next] >= w.need;
         bool timed_out = real - g_hold_began >= w.timeout;
-        if (!heard && !timed_out) return w.at;
+        if (!heard && !timed_out) {
+            if (std::fmod(real - g_hold_began, 1.5) < 0.15) *pulse = &w.repeat;
+            return w.at;
+        }
         g_held_total += real - g_hold_began;
         g_hold_began = -1;
         g_wait_next++;
@@ -128,9 +136,19 @@ void LoadScript() {
         if (size_t colon = item.find(':'); colon != std::string::npos && item.compare(colon + 1, 5, "wait=") == 0) {
             std::string text = item.substr(colon + 6);
             double timeout = 120;
+            Press repeat{0, 0, 0, 0, 0, 0};
             if (size_t sep = text.find(':'); sep != std::string::npos) {
-                timeout = std::atof(text.c_str() + sep + 1);
+                std::string rest = text.substr(sep + 1);
                 text.resize(sep);
+                timeout = std::atof(rest.c_str());
+                if (size_t sep2 = rest.find(':'); sep2 != std::string::npos) {
+                    std::string button = rest.substr(sep2 + 1);
+                    for (auto [label, index] : kNames) {
+                        if (button != label) continue;
+                        if (index < 8) repeat.buttons = uint16_t(1 << index);
+                        else repeat.analog = uint8_t(index - 8 + 1);
+                    }
+                }
             }
             int need = 1;
             if (size_t star = text.rfind('*'); star != std::string::npos) {
@@ -139,7 +157,7 @@ void LoadScript() {
             }
             for (char& c : text) c = char(std::tolower(static_cast<unsigned char>(c)));
             if (!text.empty() && g_waits.size() < kMaxWaits && std::sscanf(item.c_str(), "%lf", &at) == 1)
-                g_waits.push_back({at, timeout, text, need});
+                g_waits.push_back({at, timeout, text, need, repeat});
             continue;
         }
         if (std::sscanf(item.c_str(), "%lf:%2[a-z]=%lf:%lf", &at, name, &value, &held) >= 3) {
@@ -172,7 +190,12 @@ void LoadScript() {
 Pad ScriptedPad() {
     Pad p;
     p.connected = true;
-    double now = ScriptTime();
+    const Press* pulse;
+    double now = ScriptTime(&pulse);
+    if (pulse) {
+        p.buttons |= pulse->buttons;
+        if (pulse->analog) p.analog[pulse->analog - 1] = 0xFF;
+    }
     double started[4] = {-1, -1, -1, -1};
     for (const Press& press : g_script) {
         if (now < press.at || now >= press.until) continue;
