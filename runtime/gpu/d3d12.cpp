@@ -2166,6 +2166,13 @@ void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
     c.surf[0] = float(size.w);
     c.surf[1] = float(size.h);
     c.surf[2] = 1.0f / s.zscale;
+    // the planes the title set for this kind of vertex shader; a draw that clamps depth keeps what is past them
+    bool program = (s.vs_handle & 1) != 0;
+    if (s.zplanes_set & (program ? 2 : 1) && !(SimpleState(s, kMDepthClipControl) & 0x10)) {
+        c.zclip[0] = s.zplanes[program ? 2 : 0];
+        c.zclip[1] = s.zplanes[program ? 3 : 1];
+        c.zclip[2] = 1;
+    }
     c.ssf[0] = s.ss_x;
     c.ssf[1] = s.ss_y;
     Color(s.rs[kRsFogColor], c.fog_color);

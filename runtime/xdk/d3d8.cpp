@@ -81,6 +81,10 @@ bool InCode(uint32_t va);  // cpu/dispatch.cpp
 #define SYM_D3DDevice_SetBackBufferScale FFFFFE0C
 #define HAS_D3DDevice_SetBackBufferScale 0
 #endif
+#ifndef SYM_D3DDevice_SetDepthClipPlanes
+#define SYM_D3DDevice_SetDepthClipPlanes FFFFFE0D
+#define HAS_D3DDevice_SetDepthClipPlanes 0
+#endif
 
 namespace d3d {
 
@@ -1026,6 +1030,31 @@ HLE_STDCALL(D3DDevice_SetViewport, 1) {
     } else {  // no viewport: the whole render target, depth 0 to 1
         SetWholeViewport();
     }
+    return 0;
+}
+
+// (near, far, flags): the planes depth is clipped at, in depth buffer units, for vertex programs
+// (D3DSDCP_SET_VERTEXPROGRAM_PLANES, 1) or fixed function (D3DSDCP_SET_FIXEDFUNCTION_PLANES, 2); 3 and 4 go back to
+// the defaults (D3DSDCP_USE_DEFAULT_*). The library pushes them as the GPU's clip range on the next viewport update.
+HLE_STDCALL(D3DDevice_SetDepthClipPlanes, 3) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    float near_plane = ArgF(a, 0), far_plane = ArgF(a, 1);
+    switch (a[2]) {
+        case 1:
+            g_state.zplanes[2] = near_plane;
+            g_state.zplanes[3] = far_plane;
+            g_state.zplanes_set |= 2;
+            break;
+        case 2:
+            g_state.zplanes[0] = near_plane;
+            g_state.zplanes[1] = far_plane;
+            g_state.zplanes_set |= 1;
+            break;
+        case 3: g_state.zplanes_set &= ~2u; break;
+        case 4: g_state.zplanes_set &= ~1u; break;
+        default: return 0x8876086Cu;  // D3DERR_INVALIDCALL
+    }
+    LOG_FIRST(8, "d3d: SetDepthClipPlanes %g %g, flags %u", double(near_plane), double(far_plane), a[2]);
     return 0;
 }
 
