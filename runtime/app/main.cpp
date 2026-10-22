@@ -10,6 +10,7 @@
 #include <timeapi.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <csignal>
 #include <cwchar>
@@ -197,6 +198,14 @@ std::recursive_mutex& UiLock() {
 void ApplyDisplay() { PostMessageW(g_hwnd, kApplyDisplay, 0, 0); }
 void OpenGameWindow(bool apply) { SendMessageW(g_hwnd, kOpenWindow, apply, 0); }
 
+static std::atomic<int64_t> g_swap_slot{0};  // steady_clock ticks, 0 before the first swap
+
+std::chrono::steady_clock::time_point LastSwapSlot() {
+    using clock = std::chrono::steady_clock;
+    auto slot = clock::time_point(clock::duration(g_swap_slot.load()));
+    return clock::now() - slot > std::chrono::milliseconds(100) ? clock::time_point() : slot;
+}
+
 void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
@@ -204,6 +213,7 @@ void Pace() {
     auto now = clock::now();
     if (!cap) {
         next = now;
+        g_swap_slot = 0;  // no schedule to keep the blanks to: they run on their own clock
         return;
     }
     auto period = std::chrono::nanoseconds(1000000000ull / cap);
@@ -211,6 +221,7 @@ void Pace() {
     if (next < now - period) next = now;
     while (clock::now() + std::chrono::milliseconds(2) < next) Sleep(1);
     while (clock::now() < next) std::this_thread::yield();
+    g_swap_slot = next.time_since_epoch().count();
 }
 
 }  // namespace app
