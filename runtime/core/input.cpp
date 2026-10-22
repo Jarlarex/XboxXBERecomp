@@ -261,8 +261,8 @@ Pad ScriptedPad() {
 // The keyboard as the controller in port 1, read while the game's window has the focus: it stands in for a controller
 // when none is plugged in and adds to one when it is. The game window is no SDL window, so the keys are read from the
 // system. W and S are the right and left triggers (accelerate and brake in a racing game), A and D the left stick
-// across, the arrows the D-pad, I J K L the right stick, Enter A, Escape or Backspace B, X X, Y Y, Q white, E black,
-// Space start, Tab back.
+// across, the arrows the D-pad, I J K L the right stick, Space A (one key confirms everything, the title screen too),
+// Escape or Backspace B, X X, Y Y, Q white, E black, Enter start, Tab back.
 void AddKeyboard(Pad& p) {
     p.connected = true;
 #ifdef _WIN32
@@ -275,10 +275,10 @@ void AddKeyboard(Pad& p) {
     if (!focus) return;
     auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
     // D-pad up, down, left, right, start, back
-    constexpr int kButtons[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE, VK_TAB};
+    constexpr int kButtons[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_TAB};
     for (int i = 0; i < 6; i++) p.buttons |= uint16_t(down(kButtons[i]) << i);
     // A B X Y black white, then the triggers
-    bool analog[8] = {down(VK_RETURN), down(VK_ESCAPE) || down(VK_BACK), down('X'), down('Y'), down('E'), down('Q'),
+    bool analog[8] = {down(VK_SPACE), down(VK_ESCAPE) || down(VK_BACK), down('X'), down('Y'), down('E'), down('Q'),
                       down('S'), down('W')};
     for (int i = 0; i < 8; i++) {
         if (analog[i]) p.analog[i] = 0xFF;

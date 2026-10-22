@@ -66,7 +66,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.
-- **Keyboard** - Plays as the controller in port 1 while the window has the focus: W and S the triggers, A and D the left stick across, the arrows the D-pad, I J K L the right stick, Enter A, Escape B, X, Y, Q white, E black, Space start, Tab back.
+- **Keyboard** - Plays as the controller in port 1 while the window has the focus: W and S the triggers, A and D the left stick across, the arrows the D-pad, I J K L the right stick, Space A, Escape B, X, Y, Q white, E black, Enter start, Tab back.
 
 ### General
 - **Disc Images** - Runs the game from an ISO in the `assets` folder, either a whole disc dump or the game partition, or from the extracted data files.
