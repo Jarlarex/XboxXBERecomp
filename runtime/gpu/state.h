@@ -185,6 +185,9 @@ struct State {
     uint32_t light_enable = 0;                         // bit per light
     float ss_offset_x = 0, ss_offset_y = 0;
     float zscale = 16777215.0f;  // depth buffer units per 1.0
+    // samples a pixel across and down of the render target and its depth buffer: the multisampled back buffer's while
+    // the device's back buffer is the target (the console's test), else 1; the console draws on a grid that much smaller
+    uint32_t aa_x = 1, aa_y = 1;
 };
 
 }  // namespace gpu

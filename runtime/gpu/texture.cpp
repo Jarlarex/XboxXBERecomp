@@ -425,6 +425,22 @@ void SurfaceSize(const Surface& s, uint32_t& w, uint32_t& h) {
     }
 }
 
+void SurfaceSamples(const State& st, uint32_t data_va, uint32_t& x, uint32_t& y) {
+    bool aa = data_va && st.aa_x * st.aa_y > 1 &&
+              ((st.rt.header && data_va == mem::VirtualFromPhysical(st.rt.data)) ||
+               (st.zs.header && data_va == mem::VirtualFromPhysical(st.zs.data)));
+    x = aa ? st.aa_x : 1;
+    y = aa ? st.aa_y : 1;
+}
+
+void RasterSize(const State& st, const Surface& s, uint32_t& w, uint32_t& h) {
+    SurfaceSize(s, w, h);
+    uint32_t sx, sy;
+    SurfaceSamples(st, s.header ? mem::VirtualFromPhysical(s.data) : 0, sx, sy);
+    w = std::max(w / sx, 1u);
+    h = std::max(h / sy, 1u);
+}
+
 void MarkDirty(uint32_t res) {
     if (!res) return;
     uint32_t data = mem::VirtualFromPhysical(kernel::R32(res + 4));

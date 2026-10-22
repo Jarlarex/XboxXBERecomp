@@ -431,6 +431,7 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
+    void Filter(const Surface& src, const Surface& dst) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
     bool DeliverLate(uint32_t data) override;
@@ -547,7 +548,7 @@ private:
     void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
-    void SetViewportScissor(const State& s, uint32_t gw);
+    void SetViewportScissor(const State& s, GuestExtent size);
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
@@ -2395,21 +2396,22 @@ void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a
 }
 
 // viewport covers the target, the guest viewport is in the shader; scissor clips to it
-void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
+// size: the console's grid of the target, which a multisampled target's samples stretch further in x or y
+void D3D12Backend::SetViewportScissor(const State& s, GuestExtent size) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
     cl_->RSSetViewports(1, &vp);
-    float sc = W / gw;
-    LONG x0 = LONG(s.viewport.x * sc);
-    LONG y0 = LONG(s.viewport.y * sc);
-    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
-    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
+    float sx = W / size.w, sy = H / size.h;
+    LONG x0 = LONG(s.viewport.x * sx);
+    LONG y0 = LONG(s.viewport.y * sy);
+    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sx);
+    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sy);
     if (s.scissor_count) {
-        x0 = std::max(x0, LONG(s.scissors[0] * sc));
-        y0 = std::max(y0, LONG(s.scissors[1] * sc));
-        x1 = std::min(x1, LONG(s.scissors[2] * sc));
-        y1 = std::min(y1, LONG(s.scissors[3] * sc));
+        x0 = std::max(x0, LONG(s.scissors[0] * sx));
+        y0 = std::max(y0, LONG(s.scissors[1] * sy));
+        x1 = std::min(x1, LONG(s.scissors[2] * sx));
+        y1 = std::min(y1, LONG(s.scissors[3] * sy));
     }
     D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
                     std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
@@ -2576,7 +2578,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // constants
     GuestExtent size;
-    SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
+    RasterSize(s, bound_rt_ ? s.rt : s.zs, size.w, size.h);
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
 
@@ -2588,7 +2590,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
     SetTextureViewsAndSamplers(s, a, stages);
-    SetViewportScissor(s, size.w);
+    SetViewportScissor(s, size);
     SetBlendFactorStencilRef(s);
 
     // geometry, counted while the title runs a visibility test
@@ -2597,11 +2599,13 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     EndCountedDraw(query);
 }
 
-// a guest rect scaled to the target and clamped to it
-D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
-    float sc = float(t.w) / t.gw;
-    return {std::clamp<LONG>(LONG(x0 * sc), 0, t.w), std::clamp<LONG>(LONG(y0 * sc), 0, t.h),
-            std::clamp<LONG>(LONG(x1 * sc), 0, t.w), std::clamp<LONG>(LONG(y1 * sc), 0, t.h)};
+// a guest rect on the console's grid of the target, scaled to the target and clamped to it
+D3D12_RECT ScaledRect(const State& s, const Target& t, int x0, int y0, int x1, int y1) {
+    uint32_t ax, ay;
+    SurfaceSamples(s, t.data, ax, ay);
+    float sx = float(t.w) * ax / t.gw, sy = float(t.h) * ay / t.gh;
+    return {std::clamp<LONG>(LONG(x0 * sx), 0, t.w), std::clamp<LONG>(LONG(y0 * sy), 0, t.h),
+            std::clamp<LONG>(LONG(x1 * sx), 0, t.w), std::clamp<LONG>(LONG(y1 * sy), 0, t.h)};
 }
 
 // rs: the rects buffer, reused across targets
@@ -2611,11 +2615,11 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         for (uint32_t i = 0; i < c.count; i++) {
             int32_t r[4];
             std::memcpy(r, c.rects + size_t(i) * sizeof(r), sizeof(r));
-            rs.push_back(ScaledRect(t, r[0], r[1], r[2], r[3]));
+            rs.push_back(ScaledRect(s, t, r[0], r[1], r[2], r[3]));
         }
     } else {
         const auto& v = s.viewport;
-        rs.push_back(ScaledRect(t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
+        rs.push_back(ScaledRect(s, t, int(v.x), int(v.y), int(v.x + v.w), int(v.y + v.h)));
     }
     if (t.depth) {
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
@@ -2824,6 +2828,20 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
     bound_rt_ = bound_ds_ = nullptr;
 }
 
+void D3D12Backend::Filter(const Surface& src, const Surface& dst) {
+    if (cap_) fprintf(cap_, "%04u filter %08X to %08X\n", cap_i_++, src.data, dst.data);
+    Target* s = FindTarget(src, false);
+    Target* d = EnsureTarget(dst, false);
+    if (!s || !d || s == d) return;
+    Resolve(*s);
+    Transition(s->res.Get(), s->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(d->res.Get(), d->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    SetBlitTarget(Cpu(rtv_heap_.Get(), d->view, rtv_inc_), d->w, d->h);
+    float uv[4] = {0, 0, 1, 1};
+    Blit(s->res.Get(), s->fmt, uv, {.alpha = true, .rtv = d->fmt});
+    d->drawn = true;
+}
+
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
     PerfScope perf_copy{g_perf.copy};
@@ -2992,7 +3010,7 @@ void D3D12Backend::DrawOverlay(const Target& frame) {
     float w = float(bb_w_), h = float(bb_h_);
     float vw = std::min(w, h * aspect), vh = vw / aspect;
     float ox = (w - vw) / 2, oy = (h - vh) / 2;
-    float gw = float(frame.gw), gh = float(frame.gh);
+    float gw = float(o.display_w ? o.display_w : frame.gw), gh = float(o.display_h ? o.display_h : frame.gh);
     float dst[4] = {0, 0, gw, gh};
     if (o.dst[2] > o.dst[0] && o.dst[3] > o.dst[1])
         for (int i = 0; i < 4; i++) dst[i] = float(o.dst[i]);
