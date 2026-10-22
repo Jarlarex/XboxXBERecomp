@@ -2319,8 +2319,10 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         TextureDesc d;
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
         bool tg = targets_.count(SizedTargetKey(d.data, Format(d.format).depth, d.width, d.height));
-        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
-                res ? "" : " unbound");
+        fprintf(cap_, " | t%d %08X fmt %X %ux%u", i, d.data, d.format, d.width, d.height);
+        if (d.depth > 1) fprintf(cap_, "x%u", d.depth);
+        fprintf(cap_, "%s%s%s", d.cube ? " cube" : "", tg ? " target" : "", res ? "" : " unbound");
+        if (d.levels > 1) fprintf(cap_, " mips %u", d.levels);
         StagePalette palette;
         ReadStagePalette(s, i, d, palette);
         if (palette.va) {
@@ -2329,6 +2331,16 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         }
         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
+        }
+        if (res && !tg && stages.info[i].kind == kTex3D && cap_seen_.insert(d.data).second) {
+            // a volume as the title keeps it: tex3d_ADDR_FMT_WxHxD_levels.bin, for decoding off line
+            char name[64];
+            snprintf(name, sizeof(name), "tex3d_%08X_%X_%ux%ux%u_%u.bin", d.data, d.format, d.width, d.height, d.depth,
+                     d.levels);
+            if (FILE* f = _wfopen((cap_dir_ / name).c_str(), L"wb")) {
+                fwrite(kernel::HostPtr(d.data), 1, TotalSize(d), f);
+                fclose(f);
+            }
         }
     }
 }
@@ -2665,7 +2677,8 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
     EndCountedDraw(query);
-    if (cap_ && bound_rt_ && diag::CaptureStep() && cap_i_ % diag::CaptureStep() == 0) {
+    if (cap_ && bound_rt_ &&
+        ((diag::CaptureStep() && cap_i_ % diag::CaptureStep() == 0) || diag::CaptureInRange(cap_i_ - 1))) {
         char name[32];
         snprintf(name, sizeof(name), "%04u_%08X_step", cap_i_ - 1, bound_rt_->data);
         CapSave(*bound_rt_, name);
