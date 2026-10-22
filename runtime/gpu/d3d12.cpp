@@ -432,7 +432,7 @@ public:
     void Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) override;
     void Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects, uint32_t dst_points) override;
     void Present(const Surface& front) override;
-    void Filter(const Surface& src, const Surface& dst) override;
+    void Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) override;
     void Sync(uint32_t data, uint32_t size) override;
     void SyncLate(uint32_t data) override;
     bool DeliverLate(uint32_t data) override;
@@ -2128,6 +2128,8 @@ void FillSurfaceConstants(const State& s, GuestExtent size, DrawConstants& c) {
     c.surf[0] = float(size.w);
     c.surf[1] = float(size.h);
     c.surf[2] = 1.0f / s.zscale;
+    c.ssf[0] = s.ss_x;
+    c.ssf[1] = s.ss_y;
     Color(s.rs[kRsFogColor], c.fog_color);
     c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
     c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(Cmp(SimpleState(s, kMAlphaFunc)) - 1) : kAlphaTestAlways;
@@ -2899,8 +2901,8 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
     bound_rt_ = bound_ds_ = nullptr;
 }
 
-void D3D12Backend::Filter(const Surface& src, const Surface& dst) {
-    if (cap_) fprintf(cap_, "%04u filter %08X to %08X\n", cap_i_++, src.data, dst.data);
+void D3D12Backend::Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) {
+    if (cap_) fprintf(cap_, "%04u filter %08X (%ux%u) to %08X\n", cap_i_++, src.data, w, h, dst.data);
     Target* s = FindTarget(src, false);
     Target* d = EnsureTarget(dst, false);
     if (!s || !d || s == d) return;
@@ -2908,7 +2910,7 @@ void D3D12Backend::Filter(const Surface& src, const Surface& dst) {
     Transition(s->res.Get(), s->state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(d->res.Get(), d->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     SetBlitTarget(Cpu(rtv_heap_.Get(), d->view, rtv_inc_), d->w, d->h);
-    float uv[4] = {0, 0, 1, 1};
+    float uv[4] = {0, 0, std::min(float(w) / float(s->gw), 1.0f), std::min(float(h) / float(s->gh), 1.0f)};
     Blit(s->res.Get(), s->fmt, uv, {.alpha = true, .rtv = d->fmt});
     d->drawn = true;
 }

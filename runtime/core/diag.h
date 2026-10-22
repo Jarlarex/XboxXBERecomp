@@ -55,4 +55,33 @@ inline unsigned CaptureStep() {
     return n;
 }
 
+// XBE_MULTISAMPLE_TYPE: a D3DMULTISAMPLE_TYPE in hex that Direct3D_CreateDevice uses in place of the title's, to try
+// the other frame buffer models on a title; 0 or unset: the title's. Buffers the title supplies keep their size, and
+// D3DRS_MULTISAMPLEMODE stays at the type's own, whatever the title's state blocks set for the type it chose.
+inline unsigned MultiSampleType() {
+    static const unsigned type = [] {
+        const char* v = std::getenv("XBE_MULTISAMPLE_TYPE");
+        return v ? unsigned(std::strtoul(v, nullptr, 16)) : 0u;
+    }();
+    return type;
+}
+
+// XBE_BACKBUFFER_SCALE: "x,y" (or one factor for both) that D3DDevice_SetBackBufferScale uses in place of the
+// title's; 0 or unset: the title's
+inline bool BackBufferScale(float& x, float& y) {
+    static const float* scale = [] {
+        static float s[2] = {};
+        const char* v = std::getenv("XBE_BACKBUFFER_SCALE");
+        if (!v) return static_cast<const float*>(nullptr);
+        char* end = nullptr;
+        s[0] = std::strtof(v, &end);
+        s[1] = end && *end == ',' ? std::strtof(end + 1, nullptr) : s[0];
+        return s[0] > 0 && s[1] > 0 ? static_cast<const float*>(s) : nullptr;
+    }();
+    if (!scale) return false;
+    x = scale[0];
+    y = scale[1];
+    return true;
+}
+
 }  // namespace diag

@@ -176,8 +176,8 @@ public:
         g_perf_capture_ns += Ns(t);
     }
 
-    void Filter(const Surface& src, const Surface& dst) override {
-        Cmd c{Op::Filter};
+    void Filter(const Surface& src, const Surface& dst, uint32_t w, uint32_t h) override {
+        Cmd c{Op::Filter, w, h};
         c.s1 = src;
         c.s1.header = Header(src.header);
         c.s2 = dst;
@@ -456,7 +456,7 @@ private:
             case Op::Draw: inner_->Draw(state_, c.a, c.b, c.c, c.d ? data : nullptr); break;
             case Op::Clear: inner_->Clear(state_, c.a, c.size ? data : nullptr, c.b, c.c, c.f, c.d); break;
             case Op::Copy: inner_->Copy(c.s1, c.s2, c.a, c.b, c.c); break;
-            case Op::Filter: inner_->Filter(c.s1, c.s2); break;
+            case Op::Filter: inner_->Filter(c.s1, c.s2, c.a, c.b); break;
             case Op::Present: inner_->Present(c.s1); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
