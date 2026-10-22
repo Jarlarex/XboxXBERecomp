@@ -55,8 +55,9 @@ void RemovePad(SDL_JoystickID id) {
 // script's clock at that time until a log line containing text (any case, no commas or colons) has been written since
 // the script began, or the timeout (default 120 s) passes: "30:wait=UserProfile.xml,32:a" presses A two seconds after
 // the game opens the profile, however long loading takes. "text*3" waits for the third such line. With a button, the
-// hold presses it for 0.15 s every 1.5 s, for a screen that takes the first press only when it is ready. With a script, physical controllers are ignored, so a pad in use
-// elsewhere cannot steer the run.
+// hold presses it for 0.15 s every 1.5 s, the first time 0.75 s in, for a screen that takes the first press only
+// when it is ready. With a script, physical controllers are ignored, so a pad in use elsewhere cannot steer the
+// run.
 struct Press {
     double at, until;
     uint16_t buttons;   // Pad::buttons bits
@@ -108,7 +109,7 @@ double ScriptTime(const Press** pulse) {
         bool heard = g_heard[g_wait_next] >= w.need;
         bool timed_out = real - g_hold_began >= w.timeout;
         if (!heard && !timed_out) {
-            if (std::fmod(real - g_hold_began, 1.5) < 0.15) *pulse = &w.repeat;
+            if (std::fmod(real - g_hold_began + 0.75, 1.5) < 0.15) *pulse = &w.repeat;
             return w.at;
         }
         g_held_total += real - g_hold_began;
