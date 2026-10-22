@@ -145,6 +145,34 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
+// A colour keyed overlay: drawn only where the frame under it holds the key, which the video scaler compared with the
+// frame buffer's pixels. uvrect maps the overlay surface, framerect the frame; key.rgb is the key in 0 to 255, opts.x
+// the gamma lookup, opts.y the frame's range.
+const char* kKeyedOverlayHlsl = R"(
+cbuffer B : register(b1) { float4 uvrect; float4 framerect; float4 key; float4 opts; };
+Texture2D img : register(t0);
+Texture2D frame : register(t1);
+Texture2D lut : register(t2);
+SamplerState ls : register(s0);
+SamplerState ps : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; float2 fuv : TEXCOORD1; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = uvrect.xy + t * uvrect.zw;
+    o.fuv = framerect.xy + t * framerect.zw;
+    return o;
+}
+float4 psmain(O i) : SV_Target {
+    float3 f = round(saturate(frame.SampleLevel(ps, i.fuv, 0).rgb * opts.y) * 255);
+    if (any(abs(f - key.rgb) > 0.5)) discard;
+    float4 c = img.SampleLevel(ls, i.uv, 0);
+    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    return float4(c.rgb, 1);
+}
+)";
+
 // a solid colour over the whole target, for clears of some channels only
 const char* kSolidHlsl = R"(
 cbuffer B : register(b1) { float4 color; };
@@ -578,6 +606,7 @@ private:
     void LoadSettings();
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
     void FinishCapture(const Surface& front);
+    void CapWindow(const Surface& front);
     void StartCapture();
     void ResizeSwap();
     void UploadGammaRamp();
@@ -2999,6 +3028,7 @@ void D3D12Backend::ResizeSwap() {
 void D3D12Backend::FinishCapture(const Surface& front) {
     CapStep(Surface{});
     if (Target* f = FindTarget(front, false)) CapSave(*f, "final");
+    CapWindow(front);
     if (Tex* ov = OverlayTexture()) {
         D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         CapSave({.res = ov->res.Get(), .state = &st, .fmt = ov->fmt, .w = ov->d.width, .h = ov->d.height}, "overlay");
@@ -3099,13 +3129,40 @@ Tex* D3D12Backend::OverlayTexture() {
     return &tx;
 }
 
+// the frame as the window shows it, the overlay over it and the interface left out, as window.bmp in a capture
+void D3D12Backend::CapWindow(const Surface& front) {
+    Target* t = FindTarget(front, false);
+    if (!t || free_rtv_.empty()) return;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = td.Format;
+    ComPtr<ID3D12Resource> img;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_RENDER_TARGET, &cv,
+                                             IID_PPV_ARGS(&img)))) {
+        return;
+    }
+    // borrows the next free view for this recording, as Shrink does
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), free_rtv_.back(), rtv_inc_);
+    dev_->CreateRenderTargetView(img.Get(), nullptr, rh);
+    float black[4] = {0, 0, 0, 1};
+    cl_->ClearRenderTargetView(rh, black, 0, nullptr);
+    cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    BlitFrame(*t);
+    DrawOverlay(*t);
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    CapSave({.res = img.Get(), .state = &st, .fmt = kBgra, .w = bb_w_, .h = bb_h_}, "window");
+    CurrentFrame().garbage.push_back(img);
+}
+
 // The overlay over the window's image, mapped as BlitFrame maps the frame. A colour keyed overlay shows only where
-// the frame holds the key; that test is not made yet, the whole destination is covered.
+// the frame holds the key.
 void D3D12Backend::DrawOverlay(const Target& frame) {
     Tex* tx = OverlayTexture();
     if (!tx) return;
     const Overlay& o = overlay_;
-    if (o.color_key) LOG_FIRST(1, "d3d12: colour keyed overlay drawn without its key");
     bool wide = app::Widescreen();
     float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
     float w = float(bb_w_), h = float(bb_h_);
@@ -3125,7 +3182,31 @@ void D3D12Backend::DrawOverlay(const Target& frame) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     float uv[4] = {src[0] / tw, src[1] / th, (src[2] - src[0]) / tw, (src[3] - src[1]) / th};
-    Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_});
+    if (!o.color_key) {
+        Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_});
+        return;
+    }
+    ID3D12PipelineState* pso = EnsurePassPipeline(kKeyedOverlayHlsl, "psmain", kBgra, -1);
+    if (!pso) return;
+    uint32_t slot = AllocSrvSlots(3);
+    ID3D12Resource* views[3] = {tx->res.Get(), frame.res.Get(), lut_.Get()};
+    DXGI_FORMAT formats[3] = {tx->fmt, frame.fmt, kBgra};
+    for (int i = 0; i < 3; i++) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = formats[i];
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(views[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+    }
+    // the key is a pixel of the frame buffer, X8R8G8B8
+    float c[16] = {uv[0], uv[1], uv[2], uv[3],
+                   dst[0] / gw, dst[1] / gh, (dst[2] - dst[0]) / gw, (dst[3] - dst[1]) / gh,
+                   float(o.key >> 16 & 0xFF), float(o.key >> 8 & 0xFF), float(o.key & 0xFF), 0,
+                   gamma_ ? 1.0f : 0.0f, frame.range, 0, 0};
+    Alloc cb = Upload(256, 256);
+    std::memcpy(cb.cpu, c, sizeof c);
+    DrawFullScreen(pso, cb.gpu, slot);
 }
 
 void D3D12Backend::RenderUi() {
