@@ -145,6 +145,16 @@ float4 psmain(O i) : SV_Target {
 }
 )";
 
+// a solid colour over the whole target, for clears of some channels only
+const char* kSolidHlsl = R"(
+cbuffer B : register(b1) { float4 color; };
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 psmain() : SV_Target { return color; }
+)";
+
 const char* kDepthHlsl = R"(
 Texture2D<float> img : register(t0);
 SamplerState ps : register(s1);
@@ -551,6 +561,7 @@ private:
     ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile, uint64_t& hash);
     // Blit's pipeline
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over = false);
+    ID3D12PipelineState* EnsureMaskedClearPipeline(DXGI_FORMAT rtv, uint8_t mask);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv) const;
     // Init, in order, each callee right after its caller
     bool CreateDevice();
@@ -1398,6 +1409,22 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
         blend.BlendOp = blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
     }
     dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso));
+    return pso.Get();
+}
+
+// a masked clear's pipeline, kept in blit_psos_: the solid colour, writing the D3D12_COLOR_WRITE_ENABLE channels in
+// mask; null when it can't be made
+constexpr uint64_t kMaskedClearKey = 0xC1EAull << 48;
+ID3D12PipelineState* D3D12Backend::EnsureMaskedClearPipeline(DXGI_FORMAT rtv, uint8_t mask) {
+    auto& pso = blit_psos_[kMaskedClearKey | uint64_t(rtv) << 8 | mask];
+    if (pso) return pso.Get();
+    uint64_t h;
+    ID3DBlob* vs = Compile(kSolidHlsl, "vs", "vs_5_0", h);
+    ID3DBlob* ps = Compile(kSolidHlsl, "psmain", "ps_5_0", h);
+    if (!vs || !ps) return nullptr;
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv);
+    d.BlendState.RenderTarget[0].RenderTargetWriteMask = mask;
+    if (FAILED(dev_->CreateGraphicsPipelineState(&d, IID_PPV_ARGS(&pso)))) return nullptr;
     return pso.Get();
 }
 
@@ -2603,7 +2630,30 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
         float col[4];
         Color(c.color, col);
         for (int i = 0; t.range != 1 && i < 3; i++) col[i] /= t.range;
-        cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), col, UINT(rs.size()), rs.data());
+        // D3DCLEAR_TARGET_R, _G, _B and _A clear those channels alone (Forza Motorsport clears alpha with depth)
+        uint32_t channels = c.flags & kClearTarget;
+        D3D12_CPU_DESCRIPTOR_HANDLE rh = Cpu(rtv_heap_.Get(), t.view, rtv_inc_);
+        if (channels == kClearTarget) {
+            cl_->ClearRenderTargetView(rh, col, UINT(rs.size()), rs.data());
+        } else if (ID3D12PipelineState* pso = EnsureMaskedClearPipeline(t.fmt, uint8_t(channels >> 4))) {
+            cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
+            bound_rt_ = bound_ds_ = nullptr;
+            Alloc cb = Upload(256, 256);
+            std::memcpy(cb.cpu, col, sizeof(col));
+            uint32_t slot = AllocSrvSlots(1);
+            D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+            sv.Format = kBgra;
+            sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+            sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+            sv.Texture2D.MipLevels = 1;
+            dev_->CreateShaderResourceView(nullptr, &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+            D3D12_VIEWPORT vp{0, 0, float(t.w), float(t.h), 0, 1};
+            cl_->RSSetViewports(1, &vp);
+            for (const D3D12_RECT& r : rs) {
+                cl_->RSSetScissorRects(1, &r);
+                DrawFullScreen(pso, cb.gpu, slot);
+            }
+        }
     }
     t.drawn = true;
 }
