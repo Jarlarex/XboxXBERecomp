@@ -42,8 +42,11 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
 enum class Op : uint8_t {
-    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, ClearReport, GetReport, Overlay, Filter
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Fetch, Flush, Gamma, ClearReport, GetReport, Overlay, Filter
 };
+
+// a fetch the title stopped asking about before it was made is not written, in case the memory went to another use
+constexpr uint64_t kFetchBatches = 30;
 
 struct Cmd {
     Op op;
@@ -253,6 +256,24 @@ public:
         auto it = last_use_.find(resource);
         if (it != last_use_.end()) Wait(it->second, WaitFor::Resource, "resource");
     }
+    bool Fetching(uint32_t data) override {
+        if (auto it = fetching_.find(data); it != fetching_.end()) {
+            uint64_t done = done_.load();
+            if (done < it->second + kFetchBatches) {
+                // the copy is recorded once the render thread is past the batch that asked for it
+                if (it->second > done || !inner_->Fetched(data)) return true;
+                fetching_.erase(it);
+                return false;
+            }
+            fetching_.erase(it);
+        }
+        if (!written_.erase(data)) return false;
+        Cmd c{Op::Fetch};
+        c.a = data;
+        cur_->cmds.push_back(c);
+        fetching_[data] = cur_->id;
+        return true;
+    }
 
 private:
     Batch* NewBatch() {
@@ -460,6 +481,7 @@ private:
             case Op::Present: inner_->Present(c.s1); break;
             case Op::Sync: inner_->Sync(c.a, 0); break;
             case Op::RecordLate: inner_->RecordLate(c.a); break;
+            case Op::Fetch: inner_->StartFetch(c.a); break;
             case Op::Flush: inner_->Flush(); break;
             case Op::Gamma: inner_->SetGamma(data); break;
             case Op::ClearReport: inner_->ClearReport(); break;
@@ -498,6 +520,7 @@ private:
     State sent_;  // the state as the render thread will have it
     std::unordered_map<uint32_t, uint64_t> last_use_;
     std::unordered_set<uint32_t> written_;  // surfaces drawn since their last read-back, by data address
+    std::unordered_map<uint32_t, uint64_t> fetching_;  // IsBusy's fetches on their way: the batch that asked
     std::unordered_set<uint64_t> logged_;   // perf diagnostic: read-backs named once, by address and kind
     uint64_t next_id_ = 0, last_present_ = 0;
 

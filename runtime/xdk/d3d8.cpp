@@ -660,11 +660,12 @@ HLE_STDCALL(D3DResource_IsBusy, 1) {
     if ((common & 0x780000) || (parent && (R32(parent) & 0x780000))) return 1;  // internal reference count
     if (!g_backend) return 0;
     if (g_backend->Busy(res)) return 1;
-    // Not busy, the GPU is done with it: a title may now read what the GPU drew straight from memory, without a lock
-    // (Forza Motorsport measures its exposure from a render target it locked once, when it made it), so a texture or
-    // surface the GPU wrote comes back as BlockOnResource brings it
+    // Once IsBusy says no, a title may read what the GPU drew straight from memory, without a lock (Forza Motorsport
+    // measures its exposure from a render target it locked once, when it made it). So a texture or surface the GPU
+    // wrote stays busy while a copy of it is on its way to guest memory, as it would on the console until the GPU got
+    // there; the first ask starts the copy, and the title never waits on it.
     uint32_t type = common & 0x70000;  // 0x40000 texture, 0x50000 surface
-    if (type == 0x40000 || type == 0x50000) g_backend->Sync(mem::VirtualFromPhysical(R32(res + 4)), 0);
+    if ((type == 0x40000 || type == 0x50000) && g_backend->Fetching(mem::VirtualFromPhysical(R32(res + 4)))) return 1;
     return 0;
 }
 HLE_STDCALL(D3D_BlockOnTime, 2) { return 0; }
