@@ -14,7 +14,8 @@ void Load(const std::vector<uint8_t>& img, size_t table, const std::vector<uint3
 bool Loaded();
 // DSI3DL2LISTENER as 12 floats
 void SetListener(const float* p);
-// frames of kBins interleaved: the voice processor's mix in, the speaker bins 0..5 out
+// frames of kBins interleaved: the voice processor's mix in, every bin as the effects leave it out (the speakers, and
+// the effect sends effect-in buffers read)
 void Run(float* bins, uint32_t frames);
 
 }  // namespace dsp

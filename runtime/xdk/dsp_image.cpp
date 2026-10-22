@@ -28,7 +28,6 @@ using Buffer = std::array<float, kFrame>;
 constexpr uint32_t kBinRead = 0x1400;
 constexpr uint32_t kBinWrite = 0xC00;
 constexpr uint32_t kBinStride = 0x20;
-constexpr uint32_t kSpeakers = 6;
 
 // effect descriptor entry: {code, code bytes, state, state bytes, Y, Y bytes, scratch, scratch bytes}
 constexpr size_t kEntryBytes = 32;
@@ -453,7 +452,7 @@ void Run(float* bins, uint32_t frames) {
             for (uint32_t i = 0; i < n; i++) bin[i] = Limit(frame[i * kBins + b]);
         }
         for (uint32_t k = 0; k < g_effects.size(); k++) RunEffect(g_effects[k], k, n);
-        for (uint32_t b = 0; b < kSpeakers; b++) {
+        for (uint32_t b = 0; b < kBins; b++) {
             const Buffer& bin = At(kBinRead + b * kBinStride);
             for (uint32_t i = 0; i < n; i++) frame[i * kBins + b] = bin[i];
         }
