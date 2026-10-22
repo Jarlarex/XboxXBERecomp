@@ -96,6 +96,9 @@ struct GameInfo {
     void (*ui)(double fps);        // each frame inside the ImGui frame, UiLock held
     void (*pad)(int port, input::Pad& pad);  // a polled pad before the game gets it
     void (*rumble)(int port, uint16_t& left, uint16_t& right);
+    // the host folder of the console's hard disk (its partitions, the saves on E:), given the folder's name: hdd, or
+    // hdd2 and on for a second copy (Instance). Once, before boot; null keeps it beside the exe
+    std::filesystem::path (*hard_disk)(const std::wstring& folder);
 };
 extern const GameInfo kGame;
 
