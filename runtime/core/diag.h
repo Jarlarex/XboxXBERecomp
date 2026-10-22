@@ -1,6 +1,8 @@
 #pragma once
+#include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <utility>
 
 // diagnostics switched on by environment variables, read once
 namespace diag {
@@ -53,6 +55,18 @@ inline unsigned CaptureStep() {
         return v ? unsigned(std::strtoul(v, nullptr, 10)) : 0u;
     }();
     return n;
+}
+
+// XBE_CAPTURE_RANGE: "first-last", the draw numbers of a capture that XBE_CAPTURE_STEP saves targets after (every draw of
+// the range, whatever the step), to look at a few draws without a gigabyte of targets; unset: the step alone
+inline bool CaptureInRange(unsigned draw) {
+    static const std::pair<unsigned, unsigned> range = [] {
+        const char* v = std::getenv("XBE_CAPTURE_RANGE");
+        unsigned a = 0, b = 0;
+        if (v && std::sscanf(v, "%u-%u", &a, &b) == 2) return std::make_pair(a, b);
+        return std::make_pair(1u, 0u);
+    }();
+    return draw >= range.first && draw <= range.second;
 }
 
 // XBE_MULTISAMPLE_TYPE: a D3DMULTISAMPLE_TYPE in hex that Direct3D_CreateDevice uses in place of the title's, to try
