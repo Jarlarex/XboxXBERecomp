@@ -522,6 +522,7 @@ private:
     ID3D12Resource* BindTexture(const State& s, int stage, DrawTextures& stages);
     ID3D12Resource* BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, bool box,
                                       DrawTextures& stages);
+    ID3D12Resource* BindTargetCube(int stage, const TextureDesc& d, DrawTextures& stages);
     ID3D12Resource* BindGuestTexture(const State& s, int stage, const TextureDesc& d, const FormatInfo& fi,
                                      DrawTextures& stages);
     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
@@ -1800,6 +1801,65 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
     return tx.res.Get();
 }
 
+// textures_ entries of cube maps made from targets, apart from the guest textures keyed by palette and data
+constexpr uint64_t kTargetCubeKey = 1ull << 63;
+
+// A cube map whose faces the GPU drew, each as a surface over its face's memory (Forza Motorsport's car reflections,
+// three faces a frame): its faces come from those targets, copied once a frame into a cube of their size and format;
+// faces never drawn stay black. Null when no face is a target.
+ID3D12Resource* D3D12Backend::BindTargetCube(int stage, const TextureDesc& d, DrawTextures& stages) {
+    std::array<Target*, 6> faces{};
+    Target* any = nullptr;
+    for (uint32_t f = 0; f < 6; f++) {
+        auto it = targets_.find(SizedTargetKey(d.data + f * FaceSize(d), false, d.width, d.height));
+        if (it != targets_.end() && !it->second.depth && it->second.res) any = faces[f] = &it->second;
+    }
+    if (!any) return nullptr;
+    Tex& tx = textures_[kTargetCubeKey | d.data];
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    if (!tx.res || tx.fmt != any->fmt || tx.res->GetDesc().Width != any->w || tx.res->GetDesc().Height != any->h) {
+        if (tx.res) CurrentFrame().garbage.push_back(tx.res);
+        tx = Tex{};
+        tx.d = d;
+        tx.fmt = any->fmt;
+        tx.levels = 1;
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        D3D12_RESOURCE_DESC td{};
+        td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        td.Width = any->w;
+        td.Height = any->h;
+        td.DepthOrArraySize = 6;
+        td.MipLevels = 1;
+        td.Format = tx.fmt;
+        td.SampleDesc.Count = 1;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                 nullptr, IID_PPV_ARGS(&tx.res)))) {
+            textures_.erase(kTargetCubeKey | d.data);
+            return nullptr;
+        }
+        st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    if (tx.frame != presents_ + 1) {
+        tx.frame = presents_ + 1;
+        Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
+        for (uint32_t f = 0; f < 6; f++) {
+            Target* t = faces[f];
+            if (!t || t->fmt != tx.fmt || t->w != any->w || t->h != any->h) continue;
+            Resolve(*t);
+            Transition(t->res.Get(), t->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            D3D12_TEXTURE_COPY_LOCATION dl{tx.res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            dl.SubresourceIndex = f;
+            D3D12_TEXTURE_COPY_LOCATION sl{t->res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            sl.SubresourceIndex = 0;
+            cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        }
+        st = D3D12_RESOURCE_STATE_COPY_DEST;
+    }
+    Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    FillTextureView(tx, d, stages.sv[stage]);
+    return tx.res.Get();
+}
+
 ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
     D3D12_SHADER_RESOURCE_VIEW_DESC& sv = stages.sv[stage];
@@ -1825,6 +1885,9 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     auto tit = targets_.find(SizedTargetKey(d.data, fi.depth, d.width, d.height) | alt);
     if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
         return BindTargetTexture(s, stage, d, tit->second, box, stages);
+    }
+    if (d.cube && !fi.depth && !fi.compressed) {
+        if (ID3D12Resource* r = BindTargetCube(stage, d, stages)) return r;
     }
     return BindGuestTexture(s, stage, d, fi, stages);
 }
