@@ -340,13 +340,22 @@ uint64_t MemSig(uint32_t data, uint32_t total) {
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
 bool Changed(const Target& t) {
     if (t.drawn || t.read.empty()) return false;
-    uint32_t row = t.gw * 4;
-    uint32_t pitch = GuestPitch(t.gw);
+    uint32_t row = t.gw * t.texel;
     const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
     for (uint32_t y = 0; y < t.gh; y++) {
-        if (std::memcmp(p + size_t(y) * pitch, &t.read[size_t(y) * row], row)) return true;
+        if (std::memcmp(p + size_t(y) * t.pitch, &t.read[size_t(y) * row], row)) return true;
     }
     return false;
+}
+
+// A host colour target is BGRA; an 8 bit guest surface (the console's B8 colour format, which the XDK's L8 and A8
+// targets use) keeps the blue byte of each pixel. BGRA rows of w, src_pitch apart, into packed rows of w bytes.
+std::vector<uint8_t> BlueBytes(const uint8_t* px, size_t src_pitch, uint32_t w, uint32_t h) {
+    std::vector<uint8_t> out(size_t(w) * h);
+    for (uint32_t y = 0; y < h; y++) {
+        for (uint32_t x = 0; x < w; x++) out[size_t(y) * w + x] = px[y * src_pitch + x * 4];
+    }
+    return out;
 }
 
 // a lock alone proves nothing, reads lock too: only changed bytes mean the CPU wrote it
@@ -764,6 +773,8 @@ private:
         uint64_t delivered = 0;
         uint32_t gw = 0;
         uint32_t gh = 0;
+        uint32_t pitch = 0;  // the target's guest layout
+        uint8_t texel = 4;
         uint32_t row_pitch = 0;
         uint32_t next = 0;
     };
@@ -1161,7 +1172,17 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
     t.data = slot.data;
-    t.bytes = GuestPitch(slot.gw) * slot.gh;
+    // what Sync writes back keeps the surface's layout: 32 bit pixels at the pitch rounded to 64 bytes, or one byte a
+    // pixel for an 8 bit surface at its own pitch (Forza Motorsport's luminance target, an L8 sixteenth of the back
+    // buffer that the CPU reads)
+    TextureDesc d;
+    if (!depth && Describe(s.header, d) && Format(d.format).bits == 8) {
+        t.texel = 1;
+        t.pitch = !d.linear ? slot.gw : d.pitch ? d.pitch : (slot.gw + 63) & ~63u;
+    } else {
+        t.pitch = GuestPitch(slot.gw);
+    }
+    t.bytes = t.pitch * slot.gh;
     if (depth) t.bytes = slot.gw * slot.gh * 4;
     t.epoch = DirtyEpoch(slot.data);
     t.sig = MemSig(slot.data, t.bytes);
@@ -1266,11 +1287,10 @@ bool D3D12Backend::DepthCopy(const State& s) {
 // the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
 std::vector<uint8_t> LatchCpuChanges(Target& t) {
     std::vector<uint8_t> px(t.read.size(), 0);
-    uint32_t guest_pitch = GuestPitch(t.gw);
     const uint8_t* guest = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
     for (uint32_t y = 0; y < t.gh; y++) {
         for (uint32_t x = 0; x < t.gw; x++) {
-            const uint8_t* c = guest + size_t(y) * guest_pitch + x * 4;
+            const uint8_t* c = guest + size_t(y) * t.pitch + x * 4;
             size_t i = (size_t(y) * t.gw + x) * 4;
             if (!std::memcmp(c, &t.read[i], 4)) continue;
             std::memcpy(&t.read[i], c, 4);
@@ -3439,10 +3459,11 @@ void D3D12Backend::Sync(uint32_t data, uint32_t) {
     if (!src.res) return;
     std::vector<uint8_t> px;
     if (!ReadBack(src.res, t.gw, t.gh, px)) return;
-    // color targets are 32 bit linear in guest memory, the pitch rounds to 64 bytes
-    uint32_t pitch = GuestPitch(t.gw);
+    // color targets are linear in guest memory, rows t.pitch apart
+    if (t.texel == 1) px = BlueBytes(px.data(), size_t(t.gw) * 4, t.gw, t.gh);
+    uint32_t row = t.gw * t.texel;
     uint8_t* guest = static_cast<uint8_t*>(kernel::HostPtr(data));
-    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * pitch, &px[size_t(y) * t.gw * 4], t.gw * 4);
+    for (uint32_t y = 0; y < t.gh; y++) std::memcpy(guest + size_t(y) * t.pitch, &px[size_t(y) * row], row);
     t.read = std::move(px);
     t.drawn = false;
     t.sig = MemSig(t.data, t.bytes);
@@ -3483,9 +3504,14 @@ bool D3D12Backend::DeliverLate(uint32_t data) {
         // the last row is not padded to the pitch: a range to the end of the pitch fails to map
         D3D12_RANGE rr{0, size_t(l.row_pitch) * (l.gh - 1) + l.gw * 4};
         if (FAILED(l.rb[best]->Map(0, &rr, reinterpret_cast<void**>(&p)))) return false;
-        uint32_t pitch = GuestPitch(l.gw);
         uint8_t* dst = static_cast<uint8_t*>(kernel::HostPtr(data));
-        for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
+        if (l.texel == 4) {
+            for (uint32_t y = 0; y < l.gh; y++)
+                std::memcpy(dst + size_t(y) * l.pitch, p + size_t(y) * l.row_pitch, l.gw * 4);
+        } else {
+            std::vector<uint8_t> px = BlueBytes(p, l.row_pitch, l.gw, l.gh);
+            for (uint32_t y = 0; y < l.gh; y++) std::memcpy(dst + size_t(y) * l.pitch, &px[size_t(y) * l.gw], l.gw);
+        }
         D3D12_RANGE none{0, 0};
         l.rb[best]->Unmap(0, &none);
         l.delivered = l.fence[best];
@@ -3503,6 +3529,8 @@ void D3D12Backend::ResetLate(Late& l, const Target& t) {
     l = Late{};
     l.gw = t.gw;
     l.gh = t.gh;
+    l.pitch = t.pitch;
+    l.texel = t.texel;
 }
 
 // the target as a guest sized BGRA copy source, shrunk into l.down when it is not one already

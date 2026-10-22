@@ -653,7 +653,14 @@ HLE_STDCALL(D3DResource_IsBusy, 1) {
     // set on the device, a surface also through its texture
     uint32_t common = R32(res), parent = (common & 0x70000) == 0x50000 ? R32(res + 0x14) : 0;
     if ((common & 0x780000) || (parent && (R32(parent) & 0x780000))) return 1;  // internal reference count
-    return g_backend && g_backend->Busy(res) ? 1 : 0;
+    if (!g_backend) return 0;
+    if (g_backend->Busy(res)) return 1;
+    // Not busy, the GPU is done with it: a title may now read what the GPU drew straight from memory, without a lock
+    // (Forza Motorsport measures its exposure from a render target it locked once, when it made it), so a texture or
+    // surface the GPU wrote comes back as BlockOnResource brings it
+    uint32_t type = common & 0x70000;  // 0x40000 texture, 0x50000 surface
+    if (type == 0x40000 || type == 0x50000) g_backend->Sync(mem::VirtualFromPhysical(R32(res + 4)), 0);
+    return 0;
 }
 HLE_STDCALL(D3D_BlockOnTime, 2) { return 0; }
 HLE_STDCALL(D3DDevice_BlockOnFence, 1) {
