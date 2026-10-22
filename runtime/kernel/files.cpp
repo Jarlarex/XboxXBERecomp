@@ -7,6 +7,7 @@
 #include <iterator>
 #include <map>
 
+#include "core/diag.h"
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
@@ -538,6 +539,9 @@ static uint32_t Transfer(const Args& a, bool write, uint32_t pages) {
         if (done < chunk) break;
     }
     f->pos = pos + n;
+    if (const std::string& traced = diag::TraceReads();
+        !write && !traced.empty() && Upper(f->xbox).find(traced) != std::string::npos)
+        LOGI("read %s at %llu, %u of %u bytes", f->xbox.c_str(), (unsigned long long)pos, n, len);
     if (write && n < len) return Finish(*f, 0xC000007F, n, event, apc, apc_ctx, iosb);  // disk full
     if (!write && len && !n) {
         LOG_FIRST(64, "read at end of file: %s at %llu, %u bytes", f->xbox.c_str(), (unsigned long long)pos, len);

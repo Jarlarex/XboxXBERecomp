@@ -1,7 +1,9 @@
 #pragma once
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <string>
 #include <utility>
 
 // diagnostics switched on by environment variables, read once
@@ -96,6 +98,19 @@ inline bool BackBufferScale(float& x, float& y) {
     x = scale[0];
     y = scale[1];
     return true;
+}
+
+// XBE_TRACE_READS: reads of the files whose console path holds this text (any case) are logged with their offset and
+// length (with XBE_VERBOSE in a release build), to see which parts of a file a title streams, an XACT wave bank's waves
+// say; unset: none
+inline const std::string& TraceReads() {
+    static const std::string text = [] {
+        const char* v = std::getenv("XBE_TRACE_READS");
+        std::string s = v ? v : "";
+        for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    }();
+    return text;
 }
 
 // XBE_NO_HRTF set: DirectSound's 3D voices get the interaural delay alone, without the title's HRTF filters, to hear
