@@ -1,4 +1,15 @@
-// controllers through SDL: Xbox, PlayStation and Switch pads read into the console controller's report
+// controllers through SDL: Xbox, PlayStation and Switch pads read into the console controller's report, and the
+// keyboard as a controller
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #include "core/input.h"
 
 #include <algorithm>
@@ -213,6 +224,35 @@ Pad ScriptedPad() {
     return p;
 }
 
+// The keyboard as the controller in port 1, read while the game's window has the focus: it stands in for a controller
+// when none is plugged in and adds to one when it is. The game window is no SDL window, so the keys are read from the
+// system. W and S are the right and left triggers (accelerate and brake in a racing game), A and D the left stick
+// across, the arrows the D-pad, I J K L the right stick, Enter A, Escape or Backspace B, X X, Y Y, Q white, E black,
+// Space start, Tab back.
+void AddKeyboard(Pad& p) {
+    p.connected = true;
+#ifdef _WIN32
+    HWND window = static_cast<HWND>(app::Window());
+    if (!window || GetForegroundWindow() != window) return;
+    auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
+    // D-pad up, down, left, right, start, back
+    constexpr int kButtons[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_SPACE, VK_TAB};
+    for (int i = 0; i < 6; i++) p.buttons |= uint16_t(down(kButtons[i]) << i);
+    // A B X Y black white, then the triggers
+    bool analog[8] = {down(VK_RETURN), down(VK_ESCAPE) || down(VK_BACK), down('X'), down('Y'), down('E'), down('Q'),
+                      down('S'), down('W')};
+    for (int i = 0; i < 8; i++) {
+        if (analog[i]) p.analog[i] = 0xFF;
+    }
+    auto axis = [&](int16_t& value, int negative, int positive) {
+        if (down(negative) != down(positive)) value = down(positive) ? 32767 : -32768;
+    };
+    axis(p.lx, 'A', 'D');
+    axis(p.rx, 'J', 'L');
+    axis(p.ry, 'K', 'I');
+#endif
+}
+
 // once a millisecond at most, however many ports and threads read
 void UpdatePads() {
     static uint64_t last = 0;
@@ -285,6 +325,7 @@ Pad Poll(int port) {
             p.rx = int16_t(axis(SDL_GAMEPAD_AXIS_RIGHTX));
             p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
         }
+        if (port == 0) AddKeyboard(p);
     }
     if (app::kGame.pad) app::kGame.pad(port, p);
     return p;
@@ -307,6 +348,10 @@ uint16_t HeldOnAnyController() {
     for (SDL_Gamepad* pad : g_pads)
         for (auto [button, mask] : kFaceButtons)
             if (pad && SDL_GetGamepadButton(pad, button)) held |= mask;
+    Pad keys;
+    AddKeyboard(keys);
+    for (int i = 0; i < 4; i++)
+        if (keys.analog[i]) held |= uint16_t(0x1000 << i);
     return held;
 }
 
