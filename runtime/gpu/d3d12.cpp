@@ -2663,6 +2663,11 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     uint32_t query = BeginCountedDraw(s);
     DrawGeometry(a);
     EndCountedDraw(query);
+    if (cap_ && bound_rt_ && diag::CaptureStep() && cap_i_ % diag::CaptureStep() == 0) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X_step", cap_i_ - 1, bound_rt_->data);
+        CapSave(*bound_rt_, name);
+    }
 }
 
 // a guest rect on the console's grid of the target, scaled to the target and clamped to it
