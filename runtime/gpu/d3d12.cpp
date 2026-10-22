@@ -9,7 +9,6 @@
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
 #include <d3dcompiler.h>
-#include <dwmapi.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
@@ -3264,16 +3263,22 @@ void D3D12Backend::Present(const Surface& front) {
         // the frames stay up for uneven times. A rate that is no multiple keeps one and the title's pacing.
         sync_checked_ = presents_ ? presents_ : 1;
         UINT n = 1;
-        DWM_TIMING_INFO ti{};
-        ti.cbSize = sizeof(ti);
         uint32_t cap = app::Get().fps_cap;
-        if (cap && SUCCEEDED(DwmGetCompositionTimingInfo(nullptr, &ti)) && ti.rateRefresh.uiDenominator) {
-            double hz = double(ti.rateRefresh.uiNumerator) / ti.rateRefresh.uiDenominator, ratio = hz / cap;
-            double whole = std::round(ratio);
+        // the rate of the monitor the window is on (DWM reports the primary monitor's; on a hybrid laptop the swap
+        // chain's own adapter may not drive that monitor at all)
+        HWND hwnd = static_cast<HWND>(app::Window());
+        MONITORINFOEXW mi{};
+        mi.cbSize = sizeof(mi);
+        DEVMODEW dm{};
+        dm.dmSize = sizeof(dm);
+        if (cap && hwnd && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) &&
+            EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1) {
+            double ratio = double(dm.dmDisplayFrequency) / cap, whole = std::round(ratio);
             if (whole >= 1 && std::fabs(ratio - whole) < 0.01 * whole) n = UINT(whole);
         }
         if (n != sync_interval_)
-            LOGI("d3d12: %u display refresh%s a frame (display rate over the %u fps cap)", n, n == 1 ? "" : "es", cap);
+            LOGI("d3d12: %u display refresh%s a frame (display %u Hz, cap %u fps)", n, n == 1 ? "" : "es",
+                 unsigned(dm.dmDisplayFrequency), cap);
         sync_interval_ = n;
     }
     auto perf_swap = PerfClock::now();
