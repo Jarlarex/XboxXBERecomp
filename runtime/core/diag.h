@@ -113,4 +113,25 @@ inline const std::string& TraceReads() {
     return text;
 }
 
+// XBE_NO_HRTF set: DirectSound's 3D voices get the interaural delay alone, without the title's HRTF filters, to hear
+// what the filters change
+inline bool NoHrtf() {
+    static const bool on = std::getenv("XBE_NO_HRTF") != nullptr;
+    return on;
+}
+
+// XBE_AUDIO_DUMP: a WAV file the DirectSound mix is also written to, stereo 32 bit float at 48 kHz before the output
+// clamps it, to measure and listen to a run afterwards; unset: none
+inline const std::filesystem::path& AudioDump() {
+    static const std::filesystem::path file = [] {
+#ifdef _WIN32
+        const wchar_t* v = _wgetenv(L"XBE_AUDIO_DUMP");
+#else
+        const char* v = std::getenv("XBE_AUDIO_DUMP");
+#endif
+        return v ? std::filesystem::path(v) : std::filesystem::path();
+    }();
+    return file;
+}
+
 }  // namespace diag
