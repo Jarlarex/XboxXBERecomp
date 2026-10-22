@@ -31,6 +31,7 @@ struct PixelKey {
     TexInfo tex[4];
     uint32_t alphakill = 0;  // bit per stage
     uint32_t flat = 0, two_sided = 0;
+    uint32_t stipple = 0;    // polygon stipple: pixels the pattern clears are dropped
     uint32_t proj = 0;       // fixed function: bit per stage sampled at coordinates divided by w
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     bool operator==(const PixelKey& o) const;
@@ -101,6 +102,8 @@ struct DrawConstants {
     float lt[8][7][4];   // per light: diffuse, specular, ambient, position range, direction falloff, attenuation, cos theta/2 phi/2
     float rtshift[4];    // per kTexTarget stage: host pixels its reads move along x and y, negative up and left
     float ssf[4];        // D3D's scaling of screen space vertices onto the grid, x and y (State::ss_x, ss_y)
+    float stip[4];       // host pixels per pixel of the target's grid, which the stipple pattern repeats over
+    uint32_t stipple[32];  // the pattern's rows
 };
 
 }  // namespace gpu

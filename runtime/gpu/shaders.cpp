@@ -55,6 +55,8 @@ const char* kCommonTail = R"(    float4 spread[4];
     float4 lt[56];
     float4 rtshift;
     float4 ssf;
+    float4 stip;
+    uint4 stipple[8];
 };
 )";
 
@@ -631,6 +633,7 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
     }
     k.flat = s.simple[kMShadeMode >> 2] == 0x1D00;  // D3DSHADE_FLAT
     k.two_sided = s.rs[kRsTwoSidedLighting] != 0;
+    k.stipple = s.simple[kMStippleEnable >> 2] != 0;
     if (s.ps) {
         const uint32_t* d = s.ps->def;
         k.programmable = 1;
@@ -871,6 +874,11 @@ std::string PixelHlsl(const PixelKey& k) {
         s += F("%s tex%d : register(t%d);\n%s smp%d : register(s%d);\n", type, i, i, t.shadow ? "SamplerComparisonState" : "SamplerState", i, i);
     }
     s += F("float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n");
+    // the pattern repeats over 32 pixels of the grid the console draws on: row 0 at the top, a row's bit 31 at the left
+    if (k.stipple) {
+        s += "    uint2 sp = uint2(i.pos.xy / stip.x) & 31;\n";
+        s += "    if (!((stipple[sp.y >> 2][sp.y & 3] << sp.x) & 0x80000000)) discard;\n";
+    }
     s += "    float4 tc0 = i.tc0, tc1 = i.tc1, tc2 = i.tc2, tc3 = i.tc3;\n";
     s += k.two_sided ? "    float4 v0 = front ? i.d0 : i.b0, v1 = front ? i.d1 : i.b1;\n" : "    float4 v0 = i.d0, v1 = i.d1;\n";
     s += "    if (misc.w == 0) v1 = float4(0, 0, 0, 1);\n";

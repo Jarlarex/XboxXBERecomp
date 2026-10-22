@@ -110,6 +110,10 @@ enum : uint32_t {
     kMPsDotMapping = 0x1E74,
     kMPsInputTexture = 0x1E78,
     kMDepthClipControl = 0x1D78,
+    // polygon stipple: D3DRS_STIPPLEENABLE is a simple state, D3DDevice_SetStipple pushes the 32 rows of the
+    // pattern itself (rows at y mod 32, a row's bit 31 at x mod 32 = 0)
+    kMStippleEnable = 0x147C,
+    kMStipplePattern = 0x1480,   // 32
     // visibility tests, sent as raw commands rather than render states
     kMClearReport = 0x17C8,
     kMCountEnable = 0x17CC,
