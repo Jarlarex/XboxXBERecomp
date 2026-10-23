@@ -38,6 +38,12 @@ struct Target {
     DXGI_FORMAT fmt = DXGI_FORMAT_B8G8R8A8_UNORM;
     float range = 1;         // colour held divided by it until the extension resolves the target
     uint64_t tag = ~0ull;    // the extension's
+    // msaa: a multisampled target is read (sampled, copied, read back, shown) through its single-sampled twin, resolved
+    // once after it was last written
+    uint32_t samples = 1;
+    Microsoft::WRL::ComPtr<ID3D12Resource> single;
+    D3D12_RESOURCE_STATES single_state = D3D12_RESOURCE_STATE_COMMON;
+    uint64_t writes = 0, resolved = 0;
 };
 
 // what the renderer lends an extension, on the render thread

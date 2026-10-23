@@ -462,6 +462,20 @@ void SetFrameBuffers(const char* caller, uint32_t pp) {
         if (kRenderThread) g_backend = gpu::CreateThreadedBackend(std::move(g_backend));
     }
     uint32_t back = aa ? aa_buffers[0] : g_buffers[1];
+    // the scene's surfaces, which the msaa setting multisamples: a multisampled device's back buffer, or every buffer of
+    // a plain device (their memory rotates at Swap), and the depth buffer
+    gpu::FrameBuffers fb;
+    gpu::SurfaceSize(SurfaceOf(back), fb.color_w, fb.color_h);
+    if (aa) {
+        fb.color[0] = mem::VirtualFromPhysical(R32(back + 4));
+    } else {
+        for (uint32_t i = 0; i < g_buffer_count && i < 3; i++) fb.color[i] = mem::VirtualFromPhysical(R32(g_buffers[i] + 4));
+    }
+    if (g_depth) {
+        fb.depth = mem::VirtualFromPhysical(R32(g_depth + 4));
+        gpu::SurfaceSize(SurfaceOf(g_depth), fb.depth_w, fb.depth_h);
+    }
+    g_backend->SetFrameBuffers(fb);
     SetDev(kDevRenderTarget, back);
     SetDev(kDevDepth, g_depth);
     SetDev(kDevBackBuffer, back);

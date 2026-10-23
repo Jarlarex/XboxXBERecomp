@@ -108,6 +108,7 @@ void Load() {
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = display::Anisotropy(t["anisotropic_filtering"].value_or(int64_t(s.aniso)));
+    s.msaa = display::MsaaSamples(t["msaa"].value_or(int64_t(s.msaa)));
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.rumble_percent = std::min<uint32_t>(t["rumble_percent"].value_or(s.rumble_percent), 200);
@@ -139,6 +140,7 @@ toml::table Table() {
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
+                  {"msaa", int64_t(s.msaa)},
                   {"perf_overlay", s.perf_overlay},
                   {"join_ip", s.join_ip},
                   {"rumble_percent", int64_t(s.rumble_percent)},

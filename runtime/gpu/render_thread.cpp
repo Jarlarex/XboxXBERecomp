@@ -42,7 +42,8 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
 enum class Op : uint8_t {
-    State, Draw, Clear, Copy, Present, Sync, RecordLate, Fetch, Flush, Gamma, ClearReport, GetReport, Overlay, Filter
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Fetch, Flush, Gamma, ClearReport, GetReport, Overlay, Filter,
+    FrameBuffers
 };
 
 // a fetch the title stopped asking about before it was made is not written, in case the memory went to another use
@@ -226,6 +227,12 @@ public:
     void SetGamma(const uint8_t* ramp) override {
         Cmd c{Op::Gamma};
         c.data = Put(ramp, 768);
+        cur_->cmds.push_back(c);
+    }
+
+    void SetFrameBuffers(const FrameBuffers& fb) override {
+        Cmd c{Op::FrameBuffers};
+        c.data = Put(&fb, sizeof(fb));
         cur_->cmds.push_back(c);
     }
 
@@ -491,6 +498,12 @@ private:
                 std::memcpy(&o, data, sizeof(o));
                 o.surface = c.s1;
                 inner_->SetOverlay(o);
+                break;
+            }
+            case Op::FrameBuffers: {
+                FrameBuffers fb;
+                std::memcpy(&fb, data, sizeof(fb));
+                inner_->SetFrameBuffers(fb);
                 break;
             }
         }

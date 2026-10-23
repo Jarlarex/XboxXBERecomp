@@ -27,11 +27,23 @@ struct Overlay {
     uint32_t display_w = 0, display_h = 0;  // the front buffers' size, which dst is in; 0 for the frame's
 };
 
+// The device's own frame buffers as the present parameters set them up: the surfaces a title's scene draws into, which
+// the msaa setting multisamples. Guest virtual addresses of their data, 0 for none; a plain device rotates its colour
+// buffers' memory at Swap, so all of them are listed.
+struct FrameBuffers {
+    uint32_t color[3] = {};
+    uint32_t color_w = 0, color_h = 0;
+    uint32_t depth = 0;
+    uint32_t depth_w = 0, depth_h = 0;
+};
+
 class Backend {
 public:
     virtual ~Backend() = default;
     // the title's back buffer size, the output window may differ
     virtual bool Init(uint32_t width, uint32_t height) = 0;
+    // at device creation and Reset, before the frame buffers are drawn to
+    virtual void SetFrameBuffers(const FrameBuffers& /*fb*/) {}
     // rects: count D3DRECTs (4 x int32), null for the whole viewport
     virtual void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                        uint32_t stencil) = 0;
