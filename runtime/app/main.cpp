@@ -79,6 +79,24 @@ void DumpThreads() {
         }
 }
 
+// Whether fullscreen switches the display to the size in the settings. Only to another size of the desktop's own
+// shape: the display (or the GPU's scaler) fills the screen with whatever mode it is given, so a size of another shape
+// would show the picture stretched. At such a size the window covers the screen in the desktop's mode instead, and the
+// frame, drawn for that size (Output), is shown at its own shape with black bars. The desktop's own size is no mode
+// change either: switching to it anyway blanks the screen for nothing.
+bool WantsModeChange(const Settings& s, HWND hwnd) {
+    if (s.display_mode != DisplayMode::Fullscreen || !s.width || !s.height) return false;
+    MONITORINFOEXW mi{};
+    mi.cbSize = sizeof(mi);
+    DEVMODEW desktop{};
+    desktop.dmSize = sizeof(desktop);
+    if (!GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi) ||
+        !EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &desktop) || !desktop.dmPelsHeight)
+        return false;
+    if (s.width == desktop.dmPelsWidth && s.height == desktop.dmPelsHeight) return false;
+    return display::SameShape(s.width, s.height, desktop.dmPelsWidth, desktop.dmPelsHeight);
+}
+
 // window thread only
 void ApplyNow() {
     const Settings& s = Get();
@@ -92,12 +110,7 @@ void ApplyNow() {
     }
     Mode out = Output();
     LONG_PTR visible = IsWindowVisible(g_hwnd) ? WS_VISIBLE : 0;  // a window held back for a splash or handover stays so
-    DEVMODEW desktop{};
-    desktop.dmSize = sizeof(desktop);
-    EnumDisplaySettingsW(mi.szDevice, ENUM_REGISTRY_SETTINGS, &desktop);
-    // the desktop's own size is no mode change: switching to it anyway blanks the screen for nothing
-    if (s.display_mode == DisplayMode::Fullscreen && s.width && s.height &&
-        (s.width != desktop.dmPelsWidth || s.height != desktop.dmPelsHeight)) {
+    if (WantsModeChange(s, g_hwnd)) {
         DEVMODEW dm{};
         dm.dmSize = sizeof(dm);
         dm.dmPelsWidth = s.width;
@@ -144,8 +157,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     g_mode_changed = false;
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
-            } else if (Get().display_mode == DisplayMode::Fullscreen && Get().width && Get().height && !g_mode_changed &&
-                       IsWindowVisible(hwnd) && !g_apply_posted) {
+            } else if (!g_mode_changed && IsWindowVisible(hwnd) && !g_apply_posted && WantsModeChange(Get(), hwnd)) {
                 // once: restoring the window activates it again from inside the apply, and a second apply switched
                 // the mode back and forth, after which presents were not taken for a while (the game stood still
                 // until the next alt-tab)

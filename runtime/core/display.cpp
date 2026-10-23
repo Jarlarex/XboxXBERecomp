@@ -55,6 +55,19 @@ Rect FrameRect(double aspect, uint32_t w, uint32_t h) {
     return r;
 }
 
+Rect FitRect(double aspect, const Rect& outer) {
+    Rect r = FrameRect(aspect, outer.w, outer.h);
+    r.x += outer.x;
+    r.y += outer.y;
+    return r;
+}
+
+bool SameShape(uint32_t w, uint32_t h, uint32_t screen_w, uint32_t screen_h) {
+    if (!w || !h || !screen_w || !screen_h) return false;
+    double shape = double(w) / h, screen = double(screen_w) / screen_h;
+    return std::abs(shape / screen - 1.0) < 0.01;
+}
+
 float RenderScale(uint32_t percent, const Rect& frame, uint32_t guest_w, uint32_t guest_h) {
     if (!guest_w || !guest_h) return 1.0f;
     double cover = std::max(double(frame.w) / guest_w, double(frame.h) / guest_h);

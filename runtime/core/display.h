@@ -27,6 +27,11 @@ struct Rect {
 };
 // the largest rectangle of the aspect in a window of w x h, centred; the rest stays black
 Rect FrameRect(double aspect, uint32_t w, uint32_t h);
+// the same inside another rectangle (a movie of its own shape inside the picture)
+Rect FitRect(double aspect, const Rect& outer);
+// whether a display mode of w x h has the screen's shape (within 1%): a display fills the screen with any mode it is
+// given, so only such a mode shows the picture unstretched
+bool SameShape(uint32_t w, uint32_t h, uint32_t screen_w, uint32_t screen_h);
 
 // host pixels per console pixel of every render target: render_percent of what covers the picture's rectangle with one
 // host pixel per window pixel on both axes, for a title frame of guest_w x guest_h; capped so a target of up to twice the

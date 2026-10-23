@@ -3812,9 +3812,12 @@ void D3D12Backend::DrawOverlay(Target& frame, bool output) {
     Tex* tx = OverlayTexture();
     if (!tx) return;
     const Overlay& o = overlay_;
-    // the console's video scaler showed the overlay on a television of at most 16:9: a wider picture shows it as one,
-    // centred, as the menus of a widescreen title keep their 16:9 layout
-    display::Rect r = display::FrameRect(std::min(app::FrameAspect(), display::kWide), bb_w_, bb_h_);
+    // inside the picture: at the shape the title's movies were made at when the game says so (a 4:3 movie in a 16:9
+    // picture keeps its shape), else as the console's video scaler showed the overlay, on a television of at most 16:9
+    // (a wider picture shows it as one, centred, as the menus of a widescreen title keep their 16:9 layout)
+    double aspect =
+        app::kGame.overlay_aspect > 0 ? app::kGame.overlay_aspect : std::min(app::FrameAspect(), display::kWide);
+    display::Rect r = display::FitRect(aspect, display::FrameRect(app::FrameAspect(), bb_w_, bb_h_));
     float vw = float(r.w), vh = float(r.h), ox = float(r.x), oy = float(r.y);
     float gw = float(o.display_w ? o.display_w : frame.gw), gh = float(o.display_h ? o.display_h : frame.gh);
     float dst[4] = {0, 0, gw, gh};

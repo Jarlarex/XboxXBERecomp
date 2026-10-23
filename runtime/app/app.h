@@ -133,6 +133,9 @@ struct GameInfo {
     // the game's hooks give the title any picture aspect FrameAspect reports (a widescreen title's camera and 2D
     // layouts), so aspect_ratio auto follows the window; without, a title draws the console's 16:9 or 4:3
     bool any_aspect = false;
+    // the shape the title's full-screen movies on the video overlay were made at, shown at it inside the picture with
+    // black bars (a 4:3 movie in a 16:9 picture); 0 maps them over the picture, as the console's video scaler did
+    double overlay_aspect = 0;
     // the folder of the player's own files besides the saves (UserData); null keeps them beside the exe
     std::filesystem::path (*user_data)() = nullptr;
 };
