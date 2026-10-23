@@ -914,11 +914,13 @@ std::vector<Lane> AudibleLanes(const Gains& from, const Gains& to, uint32_t fram
 // DirectSound's table of 3D routines (Forza's 0x3F5D8D), whose tenth entry is the HRTF filter selector (0x3F5C71).
 // The selector reads a table of record pair numbers, 61 azimuths by 31 elevations (0x40EF48), and hands back a pair of
 // 32 byte records (0x3FD988): 31 taps in sign and magnitude bytes, then the far ear's delay in samples. Per voice the
-// library sends both ears' taps and the delay to the hardware (0x3F8F5D). The taps' gain on the hardware is not
-// known. The filters keep most of their energy below 1 kHz, and scaled to the front's level over the band a race's
-// engines went past full scale, so each pair is scaled to give a sound no more low frequency power, nor power over
-// all, than the delay alone: the two ears' sums, and their taps squared, average at most 1. Without the set (a title
-// that never calls DirectSoundUseFullHRTF), or with XBE_NO_HRTF, a mono 3D voice gets the interaural delay alone.
+// library sends both ears' taps and the delay to the hardware (0x3F8F5D) unchanged, so the hardware gives every
+// record one gain, which nothing in the library states. At 1/128, the magnitude as a 7 bit fraction, the set's low
+// end would run 7 to 13 dB over the delay alone and a race's 3D mix far past full scale. At 1/512 the two ears' power
+// below 500 Hz lies within 3.4 dB under to 0.7 dB over the delay alone for nine directions in ten (median 1.4 under),
+// close to what a head does to low frequencies, and the front, the set's quietest direction, 5 dB under. 1/512 is
+// taken: inferred from the set, not measured on a console. Without the set (a title that never calls
+// DirectSoundUseFullHRTF), or with XBE_NO_HRTF, a mono 3D voice gets the interaural delay alone.
 struct HrtfTable {
     bool tried = false;
     uint32_t slot = 0;      // the 3D routine table's entry holding the selector
@@ -944,7 +946,9 @@ bool CodeIs(uint32_t va, std::initializer_list<uint8_t> bytes) {
     return true;
 }
 
-float HrirTap(uint8_t b) { return b & 0x80 ? -float(b & 0x7F) : float(b); }
+constexpr float kHrirGain = 1.0f / 512;  // every record's, see above
+// a tap byte, sign and magnitude: so read, the records' tails run smoothly, as two's complement they jump about
+float HrirTap(uint8_t b) { return (b & 0x80 ? -float(b & 0x7F) : float(b)) * kHrirGain; }
 
 // the selector the title installed, and its tables; false while there is none
 bool HrtfReady() {
@@ -1004,19 +1008,9 @@ bool Hrir(float azimuth, float elevation, float taps[2][kHrirTaps], float& itd) 
     uint32_t far_ear = g_hrtf.records + uint32_t(R16(g_hrtf.index + (ai * 31 + ei) * 2)) * 32;
     uint32_t near_ear = far_ear + 32;
     bool right = azimuth >= 0;
-    float power = 0, sum[2] = {};
     for (uint32_t k = 0; k < kHrirTaps; k++) {
         taps[0][k] = HrirTap(G<uint8_t>((right ? far_ear : near_ear) + k));
         taps[1][k] = HrirTap(G<uint8_t>((right ? near_ear : far_ear) + k));
-        power += taps[0][k] * taps[0][k] + taps[1][k] * taps[1][k];
-        sum[0] += taps[0][k];
-        sum[1] += taps[1][k];
-    }
-    power = std::max(power, sum[0] * sum[0] + sum[1] * sum[1]);
-    float scale = power > 0 ? std::sqrt(2 / power) : 0;
-    for (uint32_t k = 0; k < kHrirTaps; k++) {
-        taps[0][k] *= scale;
-        taps[1][k] *= scale;
     }
     float delay = float(G<uint8_t>(far_ear + kHrirTaps));
     itd = right ? delay : -delay;
