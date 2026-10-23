@@ -3544,7 +3544,9 @@ void D3D12Backend::DrawOverlay(Target& frame, bool output) {
     Tex* tx = OverlayTexture();
     if (!tx) return;
     const Overlay& o = overlay_;
-    display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
+    // the console's video scaler showed the overlay on a television of at most 16:9: a wider picture shows it as one,
+    // centred, as the menus of a widescreen title keep their 16:9 layout
+    display::Rect r = display::FrameRect(std::min(app::FrameAspect(), display::kWide), bb_w_, bb_h_);
     float vw = float(r.w), vh = float(r.h), ox = float(r.x), oy = float(r.y);
     float gw = float(o.display_w ? o.display_w : frame.gw), gh = float(o.display_h ? o.display_h : frame.gh);
     float dst[4] = {0, 0, gw, gh};
@@ -3579,9 +3581,11 @@ void D3D12Backend::DrawOverlay(Target& frame, bool output) {
         sv.Texture2D.MipLevels = 1;
         dev_->CreateShaderResourceView(views[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
-    // the key is a pixel of the frame buffer, X8R8G8B8
+    // the key is a pixel of the frame buffer, X8R8G8B8, under the overlay where the window shows the frame
+    display::Rect f = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
+    float fw = float(std::max(f.w, 1u)), fh = float(std::max(f.h, 1u));
     float c[24] = {uv[0], uv[1], uv[2], uv[3],
-                   dst[0] / gw, dst[1] / gh, (dst[2] - dst[0]) / gw, (dst[3] - dst[1]) / gh,
+                   (vp.TopLeftX - f.x) / fw, (vp.TopLeftY - f.y) / fh, vp.Width / fw, vp.Height / fh,
                    float(o.key >> 16 & 0xFF), float(o.key >> 8 & 0xFF), float(o.key & 0xFF), 0,
                    gamma_ ? 1.0f : 0.0f, frame.range, 0, 0,
                    xfer[0], xfer[1], xfer[2], xfer[3],
