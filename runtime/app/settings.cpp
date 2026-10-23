@@ -102,10 +102,12 @@ void Load() {
         if (mode == kModes[i]) s.display_mode = DisplayMode(i);
     s.width = t["width"].value_or(s.width);
     s.height = t["height"].value_or(s.height);
-    s.render_percent = t["render_percent"].value_or(s.render_percent);
+    s.render_percent = std::clamp<uint32_t>(t["render_percent"].value_or(s.render_percent), 10, 400);
+    std::string aspect = t["aspect_ratio"].value_or(std::string(display::AspectName(s.aspect)));
+    if (!display::ParseAspect(aspect, &s.aspect)) LOGR("settings: aspect_ratio %s is not auto, 16:9 or 4:3", aspect.c_str());
     s.fps_cap = t["fps_cap"].value_or(s.fps_cap);
     s.vsync = t["vsync"].value_or(s.vsync);
-    s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
+    s.aniso = display::Anisotropy(t["anisotropic_filtering"].value_or(int64_t(s.aniso)));
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.rumble_percent = std::min<uint32_t>(t["rumble_percent"].value_or(s.rumble_percent), 200);
@@ -133,6 +135,7 @@ toml::table Table() {
                   {"width", int64_t(s.width)},
                   {"height", int64_t(s.height)},
                   {"render_percent", int64_t(s.render_percent)},
+                  {"aspect_ratio", display::AspectName(s.aspect)},
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
@@ -193,22 +196,25 @@ Mode Output() {
     return Desktop();
 }
 
-bool Widescreen() {
-    // asked per frame and per HUD quad: the desktop mode lookup only runs when the resolution setting changes
+double FrameAspect() {
+    // asked per frame and per HUD quad: the desktop mode lookup only runs when the resolution or aspect setting changes
     static std::atomic<uint64_t> key{~0ull};
-    static std::atomic<bool> wide{true};
+    static std::atomic<double> aspect{display::kClassic};
     const Settings& s = Get();
-    uint64_t k = uint64_t(s.width) << 32 | s.height;
+    uint64_t k = uint64_t(s.width) << 32 | uint64_t(s.height) << 8 | uint8_t(s.aspect);
     if (key.exchange(k) != k) {
         Mode m = Output();
-        wide = m.width * 2 >= m.height * 3;  // 3:2 or wider
+        aspect = display::FrameAspect(s.aspect, m.width, m.height, kGame.any_aspect);
     }
-    return wide;
+    return aspect;
 }
 
-float RenderScale(uint32_t guest_height) {
-    float h = Output().height * (Get().render_percent / 100.0f);
-    return guest_height ? std::max(h / guest_height, 0.1f) : 1.0f;
+bool Widescreen() { return display::Widescreen(FrameAspect()); }
+
+float RenderScale(uint32_t guest_w, uint32_t guest_h) {
+    Mode m = Output();
+    return display::RenderScale(Get().render_percent, display::FrameRect(FrameAspect(), m.width, m.height), guest_w,
+                                guest_h);
 }
 
 }  // namespace app

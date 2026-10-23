@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "core/bindings.h"
+#include "core/display.h"
 
 // the host side: window, settings
 namespace app {
@@ -20,7 +21,8 @@ inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: just under the monito
 struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
-    uint32_t render_percent = 100;   // of the output height
+    uint32_t render_percent = 100;   // of what covers the picture's rectangle (display::RenderScale)
+    display::Aspect aspect = display::Aspect::Auto;  // aspect_ratio: the picture's shape
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
@@ -50,8 +52,12 @@ struct Mode {
 };
 Mode Desktop();
 Mode Output();
-float RenderScale(uint32_t guest_height);
-// the output is 3:2 or wider: the console reports a widescreen TV and the frame is shown 16:9, else 4:3 as on a 4:3 TV
+// the render scale for a title frame of guest_w x guest_h (display::RenderScale), from the output size the settings give
+float RenderScale(uint32_t guest_w, uint32_t guest_h);
+// the picture's width over its height (display::FrameAspect of aspect_ratio and the output size); the title's frame is
+// shown at it, centred in the window
+double FrameAspect();
+// the picture is wider than 4:3: the console reports a widescreen TV, as on one a title draws anamorphic
 bool Widescreen();
 
 std::filesystem::path ExeDir();
@@ -111,6 +117,9 @@ struct GameInfo {
     // the host folder of the console's hard disk (its partitions, the saves on E:), given the folder's name: hdd, or
     // hdd2 and on for a second copy (Instance). Once, before boot; null keeps it beside the exe
     std::filesystem::path (*hard_disk)(const std::wstring& folder);
+    // the game's hooks give the title any picture aspect FrameAspect reports (a widescreen title's camera and 2D
+    // layouts), so aspect_ratio auto follows the window; without, a title draws the console's 16:9 or 4:3
+    bool any_aspect = false;
 };
 extern const GameInfo kGame;
 

@@ -900,7 +900,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
     Begin();
-    LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
+    LOGR("d3d12: %ux%u guest, %ux%u window, picture %.3f wide, render scale %.3f (%ux%u)", width, height, bb_w_, bb_h_,
+         app::FrameAspect(), scale_, unsigned(std::lround(width * scale_)), unsigned(std::lround(height * scale_)));
     return true;
 }
 
@@ -1061,7 +1062,7 @@ void D3D12Backend::CreateTimestamps() {
 }
 
 void D3D12Backend::LoadSettings() {
-    scale_ = app::RenderScale(guest_h_);
+    scale_ = app::RenderScale(guest_w_, guest_h_);
     ext_ = g_extension.get();
     if (ext_) {
         ext_->Settings();
@@ -3243,21 +3244,19 @@ void D3D12Backend::UploadGammaRamp() {
     cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
 }
 
+// the frame into its rectangle in the window (FrameAspect): box-filtered when it is larger, a render scale over what
+// covers the rectangle being supersampling
 void D3D12Backend::BlitFrame(Target& t) {
-    // 16:9 when the console reports a widescreen display, else 4:3
-    bool wide = app::Widescreen();
-    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
-    float w = float(bb_w_);
-    float h = float(bb_h_);
-    float vw = std::min(w, h * aspect);
-    float vh = vw / aspect;
+    display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
     float uv[4] = {0, 0, 1, 1};
-    D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
+    D3D12_VIEWPORT vp{float(r.x), float(r.y), float(r.w), float(r.h), 0, 1};
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_});
+    float over = std::max(float(t.w) / std::max(r.w, 1u), float(t.h) / std::max(r.h, 1u));
+    uint32_t taps = uint32_t(std::ceil(std::max(over, 1.0f) - kTapsSlack));
+    Blit(t.res.Get(), t.fmt, uv, {.gamma = gamma_, .taps = taps});
 }
 
 void D3D12Backend::SetOverlay(const Overlay& overlay) {
@@ -3320,11 +3319,8 @@ void D3D12Backend::DrawOverlay(const Target& frame) {
     Tex* tx = OverlayTexture();
     if (!tx) return;
     const Overlay& o = overlay_;
-    bool wide = app::Widescreen();
-    float aspect = wide ? 16.0f / 9.0f : 4.0f / 3.0f;
-    float w = float(bb_w_), h = float(bb_h_);
-    float vw = std::min(w, h * aspect), vh = vw / aspect;
-    float ox = (w - vw) / 2, oy = (h - vh) / 2;
+    display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
+    float vw = float(r.w), vh = float(r.h), ox = float(r.x), oy = float(r.y);
     float gw = float(o.display_w ? o.display_w : frame.gw), gh = float(o.display_h ? o.display_h : frame.gh);
     float dst[4] = {0, 0, gw, gh};
     if (o.dst[2] > o.dst[0] && o.dst[3] > o.dst[1])
@@ -3632,30 +3628,40 @@ OverlayInfo D3D12Backend::OverlayState() const {
     o.output = "SDR";
     o.window_w = bb_w_;
     o.window_h = bb_h_;
-    o.frame_w = bb_w_;
-    o.frame_h = bb_h_;
+    display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
+    o.frame_x = r.x;
+    o.frame_y = r.y;
+    o.frame_w = r.w;
+    o.frame_h = r.h;
     return o;
 }
 
 void D3D12Backend::ApplySettings() {
-    float want = app::RenderScale(guest_h_);
+    float want = app::RenderScale(guest_w_, guest_h_);
     bool remake = ext_ && ext_->Settings();
     if (std::fabs(want - scale_) > 1e-4f || remake) {
         Flush();
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();
+        if (std::fabs(want - scale_) > 1e-4f)
+            LOGI("d3d12: render scale %.3f, %ux%u drawn at %ux%u", want, guest_w_, guest_h_,
+                 unsigned(std::lround(guest_w_ * want)), unsigned(std::lround(guest_h_ * want)));
         scale_ = want;
         if (ext_) ext_->Reset(*this);
         bound_rt_ = bound_ds_ = nullptr;
     }
 }
 
-// the target resolved, then shrunk with o when it is not guest sized BGRA; res null on failure
+// the target resolved, then shrunk with o when it is not guest sized BGRA, box-filtered over each console pixel's host
+// pixels (the mean the console's pixel would be); res null on failure
 D3D12Backend::CopySource D3D12Backend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
     Resolve(t);
     CopySource out{t.res.Get(), nullptr};
     if (t.w != t.gw || t.h != t.gh || t.fmt != kBgra) {
-        out.down = Shrink(t.res.Get(), t.state, t.fmt, t.gw, t.gh, o);
+        ShrinkOptions box = o;
+        float k = std::max(float(t.w) / t.gw, float(t.h) / t.gh);
+        box.taps = std::max(box.taps, uint32_t(std::ceil(std::max(k, 1.0f) - kTapsSlack)));
+        out.down = Shrink(t.res.Get(), t.state, t.fmt, t.gw, t.gh, box);
         out.res = out.down.Get();
     } else {
         Transition(t.res.Get(), t.state, D3D12_RESOURCE_STATE_COPY_SOURCE);
