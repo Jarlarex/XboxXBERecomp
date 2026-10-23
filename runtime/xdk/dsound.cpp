@@ -161,6 +161,10 @@ X86Func* Find(uint32_t guest);
 #define SYM_IDirectSoundStream_Use3DVoiceData FFFFFF20
 #define HAS_IDirectSoundStream_Use3DVoiceData 0
 #endif
+#ifndef SYM_XAudioSetEffectData
+#define SYM_XAudioSetEffectData FFFFFF21
+#define HAS_XAudioSetEffectData 0
+#endif
 
 namespace {
 
@@ -1507,6 +1511,8 @@ void ReportMix() {
         voices += line;
     }
     LOGI("dsound: %zu voices on bins, loudest:%s", loud.size(), voices.c_str());
+    std::string effects = dsp::Loaded() ? dsp::Report() : std::string();
+    if (!effects.empty()) LOGI("dsound: effects image:%s", effects.c_str());
     m = Meters{};
     for (auto& [obj, v] : g_voices) {
         const Data3d* d = Data3dOf(v);
@@ -1622,7 +1628,8 @@ static void AuditExports() {
         SYM(IDirectSoundBuffer_SetConeOrientation), SYM(IDirectSoundBuffer_SetConeOutsideVolume),
         SYM(IDirectSoundBuffer_SetMode), SYM(IDirectSoundBuffer_SetDopplerFactor), SYM(IDirectSound_CreateSoundStream),
         SYM(IDirectSoundBuffer_GetVoiceProperties), SYM(CDirectSoundStream_GetVoiceProperties),
-        SYM(CDirectSoundStream_SetLFO), SYM(CDirectSoundStream_SetOutputBuffer), SYM(CDirectSoundStream_SetPitch)};
+        SYM(CDirectSoundStream_SetLFO), SYM(CDirectSoundStream_SetOutputBuffer), SYM(CDirectSoundStream_SetPitch),
+        SYM(XAudioSetEffectData)};
     std::string left;
     // the library's own section: the WMA decoder shares the export ids and touches no DSOUND object
     uint32_t lo = 0, hi = 0;
@@ -1681,18 +1688,50 @@ HLE_STDCALL(IDirectSound_SetDopplerFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetRolloffFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetDistanceFactor, 3) { return 0; }
 HLE_STDCALL(IDirectSound_SetVelocity, 5) { return 0; }
-// (this, DSI3DL2LISTENER, apply): room, room HF, reflections and reverb are integers
-HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) {
-    float p[12];
+// DSI3DL2LISTENER as 12 floats: room, room HF, reflections and reverb are integers
+static void ReadListener(uint32_t at, float p[12]) {
     for (int i = 0; i < 12; i++) {
-        uint32_t v = R32(a[1] + i * 4);
+        uint32_t v = R32(at + i * 4);
         bool integer = i < 2 || i == 5 || i == 7;
         p[i] = integer ? float(int32_t(v)) : F32(v);
     }
+}
+// (this, DSI3DL2LISTENER, apply): for the reverb the effects image's location names, which the library refuses
+// without one (0x3F4E7E), as for an image downloaded with the index DSFX_IMAGELOC_UNUSED
+HLE_STDCALL(IDirectSound_SetI3DL2Listener, 3) {
+    float p[12];
+    ReadListener(a[1], p);
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    dsp::SetListener(p);
+    if (!dsp::SetListener(p)) return kInvalidCall;
     g_hf_reference = p[11];
     return 0;
+}
+// (effect, parameters, the converted state out): the XAudio helper turns a typed parameter block into an effect's
+// state and writes it with the library's own DirectSound object, which the host replaces, so it runs here. Type 12 is
+// an I3DL2 reverb's DSI3DL2LISTENER for the reverb at that index: a title that runs more than one reverb (Forza two,
+// its image locating none) sets them so. Types 4 and 10 (filters), and the state the library hands back, are not
+// reproduced.
+HLE_STDCALL(XAudioSetEffectData, 3) {
+    constexpr uint32_t kI3dl2Reverb = 12;
+    uint32_t type = a[1] ? R32(a[1]) : 0;
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (type == kI3dl2Reverb) {
+        float p[12];
+        ReadListener(a[1] + 4, p);
+        if (dsp::SetReverb(int32_t(a[0]), p)) {
+            LOGI("dsound: effect %u, I3DL2 reverb: room %.0f, room HF %.0f, decay %.2f s, HF ratio %.2f, reflections "
+                 "%.0f after %.3f s, reverb %.0f after %.3f s, diffusion %.0f, density %.0f, HF reference %.0f Hz",
+                 a[0], p[0], p[1], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
+            return 0;
+        }
+    }
+    static uint32_t warned = 0;  // a bit a type
+    if (type < 32 && !(warned >> type & 1)) {
+        warned |= 1u << type;
+        LOGW("dsound: XAudioSetEffectData of type %u for effect %u %s", type, a[0],
+             type == kI3dl2Reverb ? "finds no I3DL2 reverb there" : "not reproduced");
+    }
+    return kInvalidCall;
 }
 HLE_STDCALL(IDirectSound_SetPosition, 5) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
