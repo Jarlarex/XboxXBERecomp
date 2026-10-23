@@ -7,9 +7,7 @@
 #include <utility>
 #include <vector>
 
-namespace input {
-struct Pad;
-}
+#include "core/bindings.h"
 
 // the host side: window, settings
 namespace app {
@@ -31,6 +29,9 @@ struct Settings {
     uint32_t volume_percent = 100;   // the whole output, up to 100
     std::string language = "english";  // the dashboard language the title reads (Language)
     GpuPreference gpu = GpuPreference::HighPerformance;
+    uint32_t stick_dead_zone = 0;    // percent of a stick's travel read as rest, up to 90 (input::ApplyDeadZones)
+    uint32_t trigger_dead_zone = 0;  // the same at the bottom of a trigger's
+    input::Bindings bindings = input::DefaultBindings();  // [pad] and [keyboard]
 };
 
 // the dashboard language as the console's XC_LANGUAGE has it, 1 english to 9 portuguese; english for a name it does

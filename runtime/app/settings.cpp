@@ -8,10 +8,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
+#include <string_view>
 
 #include <toml++/toml.hpp>
 
@@ -29,6 +32,55 @@ const char* kLanguages[] = {"english", "japanese", "german",  "french",    "span
                             "italian", "korean",   "chinese", "portuguese"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
+
+// [pad] and [keyboard]: a console control's name = an input's name or a list of them, an empty list or "none" for
+// nothing. Controls left out keep their default; a name camber does not know is reported and skipped.
+template <class T>
+void LoadBindings(const toml::table& t, const char* name, std::array<std::vector<T>, input::kControls>& out,
+                  bool (*parse)(std::string_view, T*)) {
+    const toml::table* table = t[name].as_table();
+    if (!table) return;
+    for (auto&& entry : *table) {
+        std::string key(entry.first.str());
+        input::Control control;
+        if (!input::ParseControl(key, &control)) {
+            LOGR("settings: [%s] %s is not a console control, left out", name, key.c_str());
+            continue;
+        }
+        std::vector<T> list;
+        auto add = [&](const toml::node& item) {
+            std::optional<std::string> text = item.value<std::string>();
+            T value{};
+            if (text && (text->empty() || *text == "none")) return;
+            if (text && parse(*text, &value)) list.push_back(value);
+            else LOGR("settings: [%s] %s: %s is not a name camber knows, left out", name, key.c_str(),
+                      text ? text->c_str() : "a value that is not a string");
+        };
+        if (const toml::array* items = entry.second.as_array()) {
+            for (const toml::node& item : *items) add(item);
+        } else {
+            add(entry.second);
+        }
+        out[size_t(control)] = std::move(list);
+    }
+}
+
+// one name as a string, else a list
+template <class T, class Name>
+toml::table SaveBindings(const std::array<std::vector<T>, input::kControls>& bindings, Name name) {
+    toml::table table;
+    for (size_t i = 0; i < input::kControls; i++) {
+        const char* control = input::ControlName(input::Control(i));
+        if (bindings[i].size() == 1) {
+            table.insert(control, std::string(name(bindings[i][0])));
+            continue;
+        }
+        toml::array list;
+        for (const T& value : bindings[i]) list.push_back(std::string(name(value)));
+        table.insert(control, std::move(list));
+    }
+    return table;
+}
 
 }  // namespace
 
@@ -61,6 +113,10 @@ void Load() {
     std::string gpu = t["gpu"].value_or(std::string(kGpus[uint32_t(s.gpu)]));
     for (uint32_t i = 0; i < 3; i++)
         if (gpu == kGpus[i]) s.gpu = GpuPreference(i);
+    s.stick_dead_zone = std::min<uint32_t>(t["stick_dead_zone"].value_or(s.stick_dead_zone), 90);
+    s.trigger_dead_zone = std::min<uint32_t>(t["trigger_dead_zone"].value_or(s.trigger_dead_zone), 90);
+    LoadBindings(t, "pad", s.bindings.pad, input::ParsePadInput);
+    LoadBindings(t, "keyboard", s.bindings.keys, input::ParseKey);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -83,7 +139,11 @@ toml::table Table() {
                   {"rumble_percent", int64_t(s.rumble_percent)},
                   {"volume_percent", int64_t(s.volume_percent)},
                   {"language", s.language},
-                  {"gpu", kGpus[uint32_t(s.gpu)]}};
+                  {"gpu", kGpus[uint32_t(s.gpu)]},
+                  {"stick_dead_zone", int64_t(s.stick_dead_zone)},
+                  {"trigger_dead_zone", int64_t(s.trigger_dead_zone)}};
+    t.insert("pad", SaveBindings(s.bindings.pad, input::PadInputName));
+    t.insert("keyboard", SaveBindings(s.bindings.keys, input::KeyName));
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));

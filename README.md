@@ -66,7 +66,8 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.
-- **Keyboard** - Plays as the controller in port 1 while the window has the focus: W and S the triggers, A and D the left stick across, the arrows the D-pad, I J K L the right stick, Space A, Escape B, X, Y, Q white, E black, Enter start, Tab back.
+- **Keyboard** - Plays as the controller in port 1 while the window has the focus: by default W and S the triggers, A and D the left stick across, the arrows the D-pad, I J K L the right stick, Space A, Escape B, X, Y, Q white, E black, Enter start, Tab back.
+- **Bindings** - The settings file's `[pad]` and `[keyboard]` tables move any console control to other controller inputs or keys (`runtime/core/bindings.h` has the names), and `stick_dead_zone` and `trigger_dead_zone` set a round stick dead zone and a trigger dead zone in percent. The defaults are the console's layout, the keys above and no dead zone.
 
 ### General
 - **Disc Images** - Runs the game from an ISO in the `assets` folder, either a whole disc dump or the game partition, or from the extracted data files.

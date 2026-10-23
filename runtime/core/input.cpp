@@ -1,5 +1,5 @@
 // controllers through SDL: Xbox, PlayStation and Switch pads read into the console controller's report, and the
-// keyboard as a controller
+// keyboard as a controller, both through the settings file's bindings (bindings.h)
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -28,6 +28,7 @@
 #include <SDL3/SDL.h>
 
 #include "app/app.h"
+#include "core/bindings.h"
 #include "core/log.h"
 
 namespace input {
@@ -260,9 +261,10 @@ Pad ScriptedPad() {
 
 // The keyboard as the controller in port 1, read while the game's window has the focus: it stands in for a controller
 // when none is plugged in and adds to one when it is. The game window is no SDL window, so the keys are read from the
-// system. W and S are the right and left triggers (accelerate and brake in a racing game), A and D the left stick
-// across, the arrows the D-pad, I J K L the right stick, Space A (one key confirms everything, the title screen too),
-// Escape or Backspace B, X X, Y Y, Q white, E black, Enter start, Tab back.
+// system. The keys are the settings file's [keyboard] bindings; by default W and S are the right and left triggers
+// (accelerate and brake in a racing game), A and D the left stick across, the arrows the D-pad, I J K L the right
+// stick, Space A (one key confirms everything, the title screen too), Escape or Backspace B, X X, Y Y, Q white, E
+// black, Enter start, Tab back.
 void AddKeyboard(Pad& p) {
     p.connected = true;
 #ifdef _WIN32
@@ -273,23 +275,48 @@ void AddKeyboard(Pad& p) {
         LOGI(focus ? "input: the keyboard plays in port 1 (the game window has the focus)"
                    : "input: the keyboard is off (another window has the focus)");
     if (!focus) return;
-    auto down = [](int key) { return (GetAsyncKeyState(key) & 0x8000) != 0; };
-    // D-pad up, down, left, right, start, back
-    constexpr int kButtons[6] = {VK_UP, VK_DOWN, VK_LEFT, VK_RIGHT, VK_RETURN, VK_TAB};
-    for (int i = 0; i < 6; i++) p.buttons |= uint16_t(down(kButtons[i]) << i);
-    // A B X Y black white, then the triggers
-    bool analog[8] = {down(VK_SPACE), down(VK_ESCAPE) || down(VK_BACK), down('X'), down('Y'), down('E'), down('Q'),
-                      down('S'), down('W')};
-    for (int i = 0; i < 8; i++) {
-        if (analog[i]) p.analog[i] = 0xFF;
-    }
-    auto axis = [&](int16_t& value, int negative, int positive) {
-        if (down(negative) != down(positive)) value = down(positive) ? 32767 : -32768;
-    };
-    axis(p.lx, 'A', 'D');
-    axis(p.rx, 'J', 'L');
-    axis(p.ry, 'K', 'I');
+    AddKeys(p, app::Get().bindings, [](uint16_t vk) { return (GetAsyncKeyState(vk) & 0x8000) != 0; });
 #endif
+}
+
+// a controller's state as SDL reads it, buttons by their place on an Xbox controller, sticks with y up
+HostPad ReadPad(SDL_Gamepad* pad) {
+    constexpr std::pair<PadInput, SDL_GamepadButton> kButtons[] = {
+        {PadInput::A, SDL_GAMEPAD_BUTTON_SOUTH},
+        {PadInput::B, SDL_GAMEPAD_BUTTON_EAST},
+        {PadInput::X, SDL_GAMEPAD_BUTTON_WEST},
+        {PadInput::Y, SDL_GAMEPAD_BUTTON_NORTH},
+        {PadInput::Back, SDL_GAMEPAD_BUTTON_BACK},
+        {PadInput::Guide, SDL_GAMEPAD_BUTTON_GUIDE},
+        {PadInput::Start, SDL_GAMEPAD_BUTTON_START},
+        {PadInput::LeftThumb, SDL_GAMEPAD_BUTTON_LEFT_STICK},
+        {PadInput::RightThumb, SDL_GAMEPAD_BUTTON_RIGHT_STICK},
+        {PadInput::LeftShoulder, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER},
+        {PadInput::RightShoulder, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER},
+        {PadInput::DpadUp, SDL_GAMEPAD_BUTTON_DPAD_UP},
+        {PadInput::DpadDown, SDL_GAMEPAD_BUTTON_DPAD_DOWN},
+        {PadInput::DpadLeft, SDL_GAMEPAD_BUTTON_DPAD_LEFT},
+        {PadInput::DpadRight, SDL_GAMEPAD_BUTTON_DPAD_RIGHT},
+        {PadInput::Misc, SDL_GAMEPAD_BUTTON_MISC1},
+        // the Elite controller's P1 to P4: upper and lower right, upper and lower left
+        {PadInput::Paddle1, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1},
+        {PadInput::Paddle2, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2},
+        {PadInput::Paddle3, SDL_GAMEPAD_BUTTON_LEFT_PADDLE1},
+        {PadInput::Paddle4, SDL_GAMEPAD_BUTTON_LEFT_PADDLE2},
+        {PadInput::Touchpad, SDL_GAMEPAD_BUTTON_TOUCHPAD}};
+    HostPad h;
+    for (auto [input, button] : kButtons)
+        if (SDL_GetGamepadButton(pad, button)) h.buttons |= 1u << unsigned(input);
+    auto axis = [&](SDL_GamepadAxis a) { return int(SDL_GetGamepadAxis(pad, a)); };
+    h.lt = int16_t(std::max(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER), 0));
+    h.rt = int16_t(std::max(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), 0));
+    // SDL's sticks have y down
+    // not plain negation: -32768 has no positive
+    h.lx = int16_t(axis(SDL_GAMEPAD_AXIS_LEFTX));
+    h.ly = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_LEFTY));
+    h.rx = int16_t(axis(SDL_GAMEPAD_AXIS_RIGHTX));
+    h.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
+    return h;
 }
 
 // once a millisecond at most, however many ports and threads read
@@ -333,6 +360,17 @@ void Init() {
     LOGI("input: SDL %d.%d.%d", SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v));
     std::lock_guard lock(g_lock);
     g_sdl = true;
+    const app::Settings& s = app::Get();
+    const Bindings& defaults = DefaultBindings();
+    int pad_changes = 0, key_changes = 0;
+    for (size_t i = 0; i < kControls; i++) {
+        pad_changes += s.bindings.pad[i] != defaults.pad[i];
+        key_changes += s.bindings.keys[i] != defaults.keys[i];
+    }
+    LOGI("input: controller bindings %s, keyboard bindings %s, dead zones %u%% (sticks) and %u%% (triggers)",
+         pad_changes ? (std::to_string(pad_changes) + " changed").c_str() : "as on the console",
+         key_changes ? (std::to_string(key_changes) + " changed").c_str() : "the default", s.stick_dead_zone,
+         s.trigger_dead_zone);
     LoadScript();
     int count = 0;
     if (SDL_JoystickID* ids = SDL_GetGamepads(&count)) {
@@ -349,27 +387,10 @@ Pad Poll(int port) {
         std::lock_guard lock(g_lock);
         UpdatePads();
         if (SDL_Gamepad* pad = port >= 0 && port < 4 ? g_pads[port] : nullptr) {
-            p.connected = true;
-            constexpr SDL_GamepadButton kButtons[] = {
-                SDL_GAMEPAD_BUTTON_DPAD_UP,   SDL_GAMEPAD_BUTTON_DPAD_DOWN,  SDL_GAMEPAD_BUTTON_DPAD_LEFT,
-                SDL_GAMEPAD_BUTTON_DPAD_RIGHT, SDL_GAMEPAD_BUTTON_START,     SDL_GAMEPAD_BUTTON_BACK,
-                SDL_GAMEPAD_BUTTON_LEFT_STICK, SDL_GAMEPAD_BUTTON_RIGHT_STICK};
-            for (int i = 0; i < 8; i++) p.buttons |= uint16_t(SDL_GetGamepadButton(pad, kButtons[i]) << i);
-            // A B X Y black white
-            constexpr SDL_GamepadButton kAnalog[] = {SDL_GAMEPAD_BUTTON_SOUTH, SDL_GAMEPAD_BUTTON_EAST,
-                                                     SDL_GAMEPAD_BUTTON_WEST,  SDL_GAMEPAD_BUTTON_NORTH,
-                                                     SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER};
-            for (int i = 0; i < 6; i++) p.analog[i] = SDL_GetGamepadButton(pad, kAnalog[i]) ? 0xFF : 0;
-            auto axis = [&](SDL_GamepadAxis a) { return int(SDL_GetGamepadAxis(pad, a)); };
-            // 0 to 32767 into 0 to 255
-            p.analog[6] = uint8_t(std::max(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER), 0) >> 7);
-            p.analog[7] = uint8_t(std::max(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), 0) >> 7);
-            // SDL's sticks have y down
-            // not plain negation: -32768 has no positive
-            p.lx = int16_t(axis(SDL_GAMEPAD_AXIS_LEFTX));
-            p.ly = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_LEFTY));
-            p.rx = int16_t(axis(SDL_GAMEPAD_AXIS_RIGHTX));
-            p.ry = int16_t(-1 - axis(SDL_GAMEPAD_AXIS_RIGHTY));
+            const app::Settings& s = app::Get();
+            HostPad host = ReadPad(pad);
+            ApplyDeadZones(host, s.stick_dead_zone, s.trigger_dead_zone);
+            p = MapPad(host, s.bindings);
         }
         if (port == 0) AddKeyboard(p);
     }
