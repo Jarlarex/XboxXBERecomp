@@ -2073,6 +2073,13 @@ constexpr uint32_t kTexfAnisotropic = 3;
 constexpr uint32_t kTaddressWrap = 1;
 constexpr uint32_t kTaddressClamp = 3;
 
+// the anisotropic_filtering setting applies to this stage (StageSampler)
+bool ForcedAnisotropy(const State& s, int i, const DrawTextures& stages) {
+    const auto& t = s.tss[size_t(i)];
+    return t[kTssMinFilter] >= kTexfLinear && t[kTssMipFilter] && stages.sv[i].Texture2D.MipLevels > 1 &&
+           !stages.info[i].shadow;
+}
+
 D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
     D3D12_SAMPLER_DESC sd = {};
     const auto& t = s.tss[size_t(i)];
@@ -2086,8 +2093,9 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.Filter = D3D12_FILTER(fmin << 4 | fmag << 2 | fmip);
     bool anisotropic = min == kTexfAnisotropic || mag == kTexfAnisotropic;
     uint32_t an = anisotropic ? std::max<uint32_t>(t[kTssMaxAnisotropy], 1) : 1;
-    // forced only where the title filters across mip levels and the texture has them
-    if (aniso && lin(min) && mip && stages.sv[i].Texture2D.MipLevels > 1 && !stages.info[i].shadow) an = aniso;
+    // raised only where the title filters linearly across the mip levels of a texture that has them: not on shadow maps,
+    // targets read back (one level), lookup and screen textures without mips or stages it filters by point
+    if (ForcedAnisotropy(s, i, stages)) an = std::max(an, aniso);
     if (an > 1) {
         sd.Filter = D3D12_FILTER_ANISOTROPIC;
         sd.MaxAnisotropy = std::min<uint32_t>(an, 16);
@@ -2508,6 +2516,11 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         if (d.depth > 1) fprintf(cap_, "x%u", d.depth);
         fprintf(cap_, "%s%s%s", d.cube ? " cube" : "", tg ? " target" : "", res ? "" : " unbound");
         if (d.levels > 1) fprintf(cap_, " mips %u", d.levels);
+        // D3DTEXF minification, magnification and mip filters as the title set them, then what the sampler does
+        const auto& ts = s.tss[size_t(i)];
+        D3D12_SAMPLER_DESC sd = StageSampler(s, i, stages, false, app::Get().aniso);
+        fprintf(cap_, " filter %u%u%u", ts[kTssMinFilter], ts[kTssMagFilter], ts[kTssMipFilter]);
+        if (sd.Filter == D3D12_FILTER_ANISOTROPIC) fprintf(cap_, " aniso %u", sd.MaxAnisotropy);
         StagePalette palette;
         ReadStagePalette(s, i, d, palette);
         if (palette.va) {
