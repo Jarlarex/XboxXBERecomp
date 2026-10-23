@@ -30,6 +30,7 @@
 #include "app/app.h"
 #include "core/bindings.h"
 #include "core/log.h"
+#include "gpu/backend.h"
 
 namespace input {
 
@@ -102,7 +103,8 @@ void RemovePad(SDL_JoystickID id) {
 // the script began, or the timeout (default 120 s) passes: "30:wait=UserProfile.xml,32:a" presses A two seconds after
 // the game opens the profile, however long loading takes. "text*3" waits for the third such line. With a button, the
 // hold presses it for 0.15 s every 1.5 s, the first time 0.75 s in, for a screen that takes the first press only
-// when it is ready. With a script, physical controllers are ignored, so a pad in use elsewhere cannot steer the
+// when it is ready. "seconds:capture" saves a frame capture then (with XBE_CAPTURE_DIR), so two runs can capture the
+// same moment of a game. With a script, physical controllers are ignored, so a pad in use elsewhere cannot steer the
 // run.
 struct Press {
     double at, until;
@@ -119,6 +121,8 @@ struct Wait {
 };
 std::vector<Press> g_script;
 std::vector<Wait> g_waits;  // by at
+std::vector<double> g_captures;  // capture times, sorted
+size_t g_capture_next = 0;
 bool g_scripted = false;
 uint64_t g_script_start = 0;
 
@@ -218,6 +222,10 @@ void LoadScript() {
         held = 0.15;
         int n = std::sscanf(item.c_str(), "%lf:%15[a-z]:%lf", &at, name, &held);
         if (n < 2) continue;
+        if (std::strcmp(name, "capture") == 0) {
+            g_captures.insert(std::upper_bound(g_captures.begin(), g_captures.end(), at), at);
+            continue;
+        }
         for (auto [label, index] : kNames) {
             if (std::strcmp(label, name) != 0) continue;
             Press press{at, at + held, 0, 0, 0, 0};
@@ -239,6 +247,11 @@ Pad ScriptedPad() {
     p.connected = true;
     const Press* pulse;
     double now = ScriptTime(&pulse);
+    {
+        std::lock_guard lock(g_script_lock);
+        for (; g_capture_next < g_captures.size() && now >= g_captures[g_capture_next]; g_capture_next++)
+            gpu::g_capture = true;
+    }
     if (pulse) {
         p.buttons |= pulse->buttons;
         if (pulse->analog) p.analog[pulse->analog - 1] = 0xFF;
