@@ -120,6 +120,12 @@ inline bool NoHrtf() {
     return on;
 }
 
+// XBE_NO_REVERB set: the effects image's I3DL2 reverbs do not run, to hear what they add
+inline bool NoReverb() {
+    static const bool on = std::getenv("XBE_NO_REVERB") != nullptr;
+    return on;
+}
+
 // XBE_AUDIO_DUMP: a WAV file the DirectSound mix is also written to, stereo 32 bit float at 48 kHz before the output
 // clamps it, to measure and listen to a run afterwards; unset: none
 inline const std::filesystem::path& AudioDump() {

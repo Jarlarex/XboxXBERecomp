@@ -62,7 +62,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 - **Renderer Extensions** - Allows a game to change render targets, add passes and add to the generated shaders through `gpu::Extension`, set with `gpu::SetExtension` from `GameInfo::init`.
 
 ### Audio
-- **DirectSound** - Mixes sound in software through XAudio2, with Xbox ADPCM, streams, mix bins, submixes and effect-in buffers, voice filters (DLS2, parametric EQ, I3DL2), 3D sound with the title's own HRTF set, and the effects image.
+- **DirectSound** - Mixes sound in software through XAudio2, with Xbox ADPCM, streams, mix bins, submixes and effect-in buffers, voice filters (DLS2, parametric EQ, I3DL2), 3D sound with the title's own HRTF set, and the effects image (its gains, mixers, filters, crosstalk, level meters and every I3DL2 reverb in it, set through `SetI3DL2Listener` or `XAudioSetEffectData`).
 
 ### Input
 - **Controller** - Supports Xbox, PlayStation and Switch controllers through SDL3, with hot plugging and rumble.
@@ -76,7 +76,7 @@ A new XDK build needs `xdk/<build>/layout.toml` and signatures made from titles 
 
 ### Miscellaneous
 - **Boot Splash** - Place a `splash.png` (or `.bmp`) beside the exe to display a splash screen at launch.
-- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. A capture also saves `window.bmp`, the frame as the window shows it with the video overlay. `XBE_AUDIO_DUMP` writes the sound output to a WAV file, and a verbose log reports the mix's levels every few seconds. `XBE_MULTISAMPLE_TYPE` and `XBE_BACKBUFFER_SCALE` replace a title's multisample type and back buffer scale, to try the other frame buffer models. `XBE_TRACE_READS` logs each read of the files whose path holds its text, to see what a title streams. A verbose log names each controller's SDL driver and says when the keyboard takes port 1, and reports the gamma ramps a title sets and whether Windows HDR is on for the window's monitor.
+- **Diagnostics** - Logs frame timing with `XBE_PERF`, captures a frame with F3 when `XBE_CAPTURE_DIR` is set and enables the Direct3D 12 debug layer with `XBE_D3D12_DEBUG`. A capture also saves `window.bmp`, the frame as the window shows it with the video overlay. `XBE_AUDIO_DUMP` writes the sound output to a WAV file, `XBE_NO_HRTF` and `XBE_NO_REVERB` leave the HRTF filters and the effects image's reverbs out, and a verbose log reports the mix's levels every few seconds. `XBE_MULTISAMPLE_TYPE` and `XBE_BACKBUFFER_SCALE` replace a title's multisample type and back buffer scale, to try the other frame buffer models. `XBE_TRACE_READS` logs each read of the files whose path holds its text, to see what a title streams. A verbose log names each controller's SDL driver and says when the keyboard takes port 1, and reports the gamma ramps a title sets and whether Windows HDR is on for the window's monitor.
 - **Scripted Controller** - `XBE_INPUT_SCRIPT` presses buttons and moves the left or right stick on a controller in port 1 at set times for unattended runs, and can hold its clock until the game logs a given line (a file open, say), so a script follows loading times. The syntax is in the comment above `LoadScript` in `runtime/core/input.cpp`.
 - **Headless Harness** - Builds and runs a game on Linux without a window, GPU, audio or controller, for testing.
 - **SDK Sync** - Keeps the `sdk/` copies in game repositories in step with this repository.
