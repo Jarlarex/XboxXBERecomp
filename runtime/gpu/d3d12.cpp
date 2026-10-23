@@ -33,6 +33,7 @@
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/ext.h"
+#include "gpu/overlay.h"
 #include "gpu/shaders.h"
 #include "gpu/texture.h"
 #include "gpu/vertex.h"
@@ -75,6 +76,7 @@ struct Perf {
     double present = 0;
     double wait = 0;
     double swap = 0;
+    double vsync = 0;  // waiting for the swap chain to take a frame
     double sync = 0;
     // counts and bytes
     uint64_t draws = 0;
@@ -538,6 +540,10 @@ private:
         uint64_t fence = 0;
         std::vector<ComPtr<ID3D12Resource>> garbage;
         uint32_t srv = 0;
+        // GPU timestamps around each of the frame's command lists, for the performance overlay's frame
+        uint32_t stamps = 0;
+        bool stamp_open = false;
+        uint64_t overlay_frame = ~0ull;
     };
     struct Alloc {
         ID3D12Resource* res;
@@ -647,8 +653,10 @@ private:
     bool CreateRootSignature();
     void CreateFrames();
     void CreateGammaLut();
+    void CreateTimestamps();
     void LoadSettings();
     // Present, in call order, each callee right after its caller; DrawFrame runs the two after it
+    Frame& PresentFrame(const Surface& front);
     void FinishCapture(const Surface& front);
     void CapWindow(const Surface& front);
     void StartCapture();
@@ -661,7 +669,10 @@ private:
     void RenderUi();
     void ReleaseOldTextures();
     void ResetFrame();
+    void ReadTimestamps(Frame& f);
     void CountFps();
+    void SampleFrame(Frame& shown);
+    OverlayInfo OverlayState() const;
     void ApplySettings();
     ComPtr<ID3D12Resource> Shrink(ID3D12Resource* src, D3D12_RESOURCE_STATES& st, DXGI_FORMAT fmt, uint32_t w,
                                   uint32_t h, const ShrinkOptions& o = {});
@@ -783,6 +794,8 @@ private:
         uint32_t h;
     };
     std::vector<CapTex> cap_tex_;
+    bool cap_screen_ = false;  // the frame being presented ends a capture: save the swap chain's image too
+    DXGI_FORMAT swap_fmt_ = kBgra;
     ComPtr<ID3D12Resource> lut_;
     D3D12_RESOURCE_STATES lut_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
     uint8_t ramp_[768] = {};
@@ -853,7 +866,22 @@ private:
     double fps_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
+    // the performance overlay: frames as measured, and the GPU timestamps a frame's command lists are bracketed by
+    PerfOverlay overlay_stats_;
+    ComPtr<ID3D12QueryHeap> stamp_heap_;
+    ComPtr<ID3D12Resource> stamp_rb_;
+    const uint64_t* stamp_values_ = nullptr;
+    uint64_t stamp_freq_ = 0;
+    // what the counters behind the overlay's times held at the last present
+    struct Counters {
+        PerfClock::time_point present = PerfClock::now();
+        uint64_t title = 0, recording = 0, waiting = 0;
+        double host = 0;
+    } counted_at_;
 };
+
+// GPU timestamps a frame slot has room for: a begin and an end for each command list it records
+constexpr uint32_t kStampsPerFrame = 128;
 
 bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     guest_w_ = width;
@@ -866,6 +894,8 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     if (!CreateRootSignature()) return false;
     CreateFrames();
     CreateGammaLut();
+    CreateTimestamps();
+    g_perf_overlay = app::Get().perf_overlay;
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
@@ -917,7 +947,7 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.Height = bb_h_;
     sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.SampleDesc.Count = 1;
-    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT | DXGI_USAGE_SHADER_INPUT;  // read for a capture's screen.bmp
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = SwapFlags();
@@ -1011,6 +1041,25 @@ void D3D12Backend::CreateGammaLut() {
                                   IID_PPV_ARGS(&lut_));
 }
 
+// a timestamp heap with room for every frame slot, read back into one buffer kept mapped; without one the overlay shows
+// no GPU time
+void D3D12Backend::CreateTimestamps() {
+    D3D12_QUERY_HEAP_DESC qd{D3D12_QUERY_HEAP_TYPE_TIMESTAMP, kFrames * kStampsPerFrame, 0};
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd = BufferDesc(uint64_t(kFrames) * kStampsPerFrame * sizeof(uint64_t));
+    void* p = nullptr;
+    if (FAILED(queue_->GetTimestampFrequency(&stamp_freq_)) || !stamp_freq_ ||
+        FAILED(dev_->CreateQueryHeap(&qd, IID_PPV_ARGS(&stamp_heap_))) ||
+        FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&stamp_rb_))) ||
+        FAILED(stamp_rb_->Map(0, nullptr, &p))) {
+        LOGW("d3d12: no GPU timestamps, the performance overlay shows no GPU time");
+        stamp_heap_ = nullptr;
+        return;
+    }
+    stamp_values_ = static_cast<const uint64_t*>(p);
+}
+
 void D3D12Backend::LoadSettings() {
     scale_ = app::RenderScale(guest_h_);
     ext_ = g_extension.get();
@@ -1025,9 +1074,25 @@ void D3D12Backend::Begin() {
     cl_->SetDescriptorHeaps(2, heaps);
     cl_->SetGraphicsRootSignature(root_.Get());
     bound_rt_ = bound_ds_ = nullptr;
+    Frame& f = CurrentFrame();
+    if (stamp_heap_ && f.stamps + 2 <= kStampsPerFrame) {
+        cl_->EndQuery(stamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, uint32_t(frame_ % kFrames) * kStampsPerFrame + f.stamps);
+        f.stamps++;
+        f.stamp_open = true;
+    }
 }
 
 void D3D12Backend::Submit(bool wait) {
+    Frame& sf = CurrentFrame();
+    if (sf.stamp_open) {
+        // the list's begin and end stamps into the frame slot's place in the read-back buffer
+        uint32_t at = uint32_t(frame_ % kFrames) * kStampsPerFrame + sf.stamps;
+        cl_->EndQuery(stamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, at);
+        cl_->ResolveQueryData(stamp_heap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, at - 1, 2, stamp_rb_.Get(),
+                              uint64_t(at - 1) * sizeof(uint64_t));
+        sf.stamps++;
+        sf.stamp_open = false;
+    }
     cl_->Close();
     ID3D12CommandList* lists[] = {cl_.Get()};
     queue_->ExecuteCommandLists(1, lists);
@@ -3120,6 +3185,7 @@ void D3D12Backend::FinishCapture(const Surface& front) {
     fclose(cap_);
     cap_ = nullptr;
     cap_tex_.clear();
+    cap_screen_ = true;
     LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
 }
 
@@ -3293,6 +3359,7 @@ void D3D12Backend::RenderUi() {
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
     if (app::kGame.ui) app::kGame.ui(fps_);
+    if (g_perf_overlay) overlay_stats_.Draw(OverlayState(), bb_h_);
     ImGui::Render();
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
@@ -3310,6 +3377,14 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     if (t) BlitFrame(*t);
     if (t) DrawOverlay(*t);
     RenderUi();
+    if (cap_screen_) {
+        // the captured frame as the swap chain shows it, the interface included, as screen.bmp
+        cap_screen_ = false;
+        ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+        cl_->SetDescriptorHeaps(2, heaps);
+        cl_->SetGraphicsRootSignature(root_.Get());
+        CapSave({.res = bb_[bi].Get(), .state = &bs, .fmt = swap_fmt_, .w = bb_w_, .h = bb_h_}, "screen");
+    }
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
 
@@ -3329,6 +3404,19 @@ void D3D12Backend::ReleaseOldTextures() {
     }
 }
 
+// the frame slot's command lists are done: their time on the GPU, summed, goes to the overlay's frame
+void D3D12Backend::ReadTimestamps(Frame& f) {
+    if (stamp_values_ && f.overlay_frame != ~0ull && f.stamps >= 2) {
+        const uint64_t* v = stamp_values_ + size_t(&f - frames_) * kStampsPerFrame;
+        uint64_t ticks = 0;
+        for (uint32_t i = 0; i + 1 < f.stamps; i += 2) ticks += v[i + 1] > v[i] ? v[i + 1] - v[i] : 0;
+        overlay_stats_.SetGpu(f.overlay_frame, double(ticks) * 1000.0 / double(stamp_freq_));
+    }
+    f.stamps = 0;
+    f.stamp_open = false;
+    f.overlay_frame = ~0ull;
+}
+
 void D3D12Backend::ResetFrame() {
     Frame& f = CurrentFrame();
     if (f.fence && fence_->GetCompletedValue() < f.fence) {
@@ -3336,6 +3424,7 @@ void D3D12Backend::ResetFrame() {
         WaitFence(f.fence);
         g_perf.wait += PerfMs(perf_wait);
     }
+    ReadTimestamps(f);
     f.alloc->Reset();
     f.garbage.clear();
     f.used = 0;
@@ -3402,8 +3491,36 @@ void LogPerf() {
     }
 }
 
+// the render thread's time in the backend with its waits for the GPU and the display left out
+double HostBusy() {
+    const Perf& p = g_perf;
+    return p.draw + p.clear + p.copy + p.sync + p.present - p.swap - p.wait - p.vsync;
+}
+
 void D3D12Backend::Present(const Surface& front) {
-    PerfScope perf_present{g_perf.present};
+    Frame* shown;
+    {
+        PerfScope perf_present{g_perf.present};
+        shown = &PresentFrame(front);
+    }
+    // the frame's times are all in now
+    SampleFrame(*shown);
+    CountFps();
+    if (diag::Perf() && presents_ % 30 == 0) {
+        FrameSample m = overlay_stats_.Mean(30);
+        LOGI("perf: overlay, last 30 frames: %.2f ms apart, title %.2f (recording %.2f, waiting %.2f), render thread "
+             "%.2f, GPU %.2f", m.gap, m.title, m.recording, m.waiting, m.host, m.gpu);
+    }
+    if (diag::Perf()) LogPerf();
+    // LogPerf starts its counters again: the overlay counts from where they are now
+    counted_at_.host = HostBusy();
+    counted_at_.recording = g_perf_capture_ns.load();
+    counted_at_.waiting = g_perf_wait_ns.load();
+    ApplySettings();
+}
+
+// returns the frame slot it presented
+D3D12Backend::Frame& D3D12Backend::PresentFrame(const Surface& front) {
     if (cap_) {
         FinishCapture(front);
     } else if ((g_capture.exchange(false) || AutoCaptureDue()) && CaptureOn()) {
@@ -3416,7 +3533,10 @@ void D3D12Backend::Present(const Surface& front) {
     if (ramp_dirty_) UploadGammaRamp();
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 
-    if (latency_wait_ && app::Get().vsync) WaitForSingleObjectEx(latency_wait_, 100, TRUE);
+    if (latency_wait_ && app::Get().vsync) {
+        PerfScope perf_vsync{g_perf.vsync};
+        WaitForSingleObjectEx(latency_wait_, 100, TRUE);
+    }
     uint32_t bi = swap_->GetCurrentBackBufferIndex();
     DrawFrame(t, bi);
     Submit(false);
@@ -3459,14 +3579,49 @@ void D3D12Backend::Present(const Surface& front) {
     swap_->Present(vsync ? sync_interval_ : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
     g_perf.swap += PerfMs(perf_swap);
 
+    Frame& shown = CurrentFrame();
     presents_++;
     presents_seen_.store(presents_);
     frame_++;
     ReleaseOldTextures();
     ResetFrame();
-    CountFps();
-    if (diag::Perf()) LogPerf();
-    ApplySettings();
+    return shown;
+}
+
+// the frame just presented, for the performance overlay: each counter's growth since the last present; its GPU time
+// follows once the slot comes round again (ReadTimestamps)
+void D3D12Backend::SampleFrame(Frame& shown) {
+    auto delta = [](uint64_t now, uint64_t& at) {
+        uint64_t d = now >= at ? now - at : now;  // LogPerf may have started it again
+        at = now;
+        return double(d) / 1e6;
+    };
+    FrameSample s;
+    s.gap = PerfMs(counted_at_.present);
+    counted_at_.present = PerfClock::now();
+    s.title = delta(g_perf_title_ns.load(), counted_at_.title);
+    s.recording = delta(g_perf_capture_ns.load(), counted_at_.recording);
+    s.waiting = delta(g_perf_wait_ns.load(), counted_at_.waiting);
+    double host = HostBusy();
+    s.host = std::max(0.0, host - counted_at_.host);
+    counted_at_.host = host;
+    shown.overlay_frame = overlay_stats_.Add(s);
+}
+
+OverlayInfo D3D12Backend::OverlayState() const {
+    OverlayInfo o;
+    o.fps = fps_;
+    o.target_fps = app::TargetFps();
+    o.guest_w = guest_w_;
+    o.guest_h = guest_h_;
+    o.scale = scale_;
+    o.aniso = app::Get().aniso;
+    o.output = "SDR";
+    o.window_w = bb_w_;
+    o.window_h = bb_h_;
+    o.frame_w = bb_w_;
+    o.frame_h = bb_h_;
+    return o;
 }
 
 void D3D12Backend::ApplySettings() {

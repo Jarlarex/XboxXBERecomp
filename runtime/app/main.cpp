@@ -23,6 +23,7 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/overlay.h"
 #include "image_symbols.h"
 #include "kernel/kernel.h"
 
@@ -129,6 +130,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
         case WM_KEYDOWN:
             if (wp == VK_F3) DumpThreads();
+            if (wp == VK_F2 && !(lp & (1 << 30))) gpu::g_perf_overlay = !gpu::g_perf_overlay;  // not on repeats
             return 0;
         case WM_ACTIVATE:
             if (LOWORD(wp) == WA_INACTIVE) {

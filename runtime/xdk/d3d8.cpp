@@ -1010,9 +1010,15 @@ HLE_STDCALL(D3DDevice_Swap, 1) {
     bool scaled = !g_aa && (g_scale_x != 1 || g_scale_y != 1);
     if (scaled) FilterBackBuffer(g_buffers[0]);
     if (g_backend) g_backend->Present(SurfaceOf(g_aa ? Dev(kDevFrontBuffer) : g_buffers[scaled ? 0 : 1]));
+    // the title's frame for the performance overlay: from the end of the last pacing sleep to this one's start
+    static std::chrono::steady_clock::time_point paced;
+    auto now = std::chrono::steady_clock::now();
+    if (paced != std::chrono::steady_clock::time_point())
+        gpu::g_perf_title_ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - paced).count());
     // D3DRS_PRESENTATIONINTERVAL: the vertical blanks a frame stays up, 0x80000000 set for "or immediately when late"
     uint32_t interval = R32(kRenderState + gpu::kRsPresentationInterval * 4) & 0xFF;
     app::Pace(interval);
+    paced = std::chrono::steady_clock::now();
     if (diag::Perf() && kVBlank) {
         // the vertical blanks the title sees between two swaps: a title that times its frames by them (the library's
         // count is what the game reads) wants one or two every time, whatever the host's display does

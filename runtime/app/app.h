@@ -24,6 +24,7 @@ struct Settings {
     uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
+    bool perf_overlay = false;       // the performance overlay at start; F2 toggles it
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     uint32_t rumble_percent = 100;   // of the title's motor speeds, up to 200; past full speed it saturates
     uint32_t volume_percent = 100;   // the whole output, up to 100
