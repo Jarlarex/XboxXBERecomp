@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 #include <toml++/toml.hpp>
@@ -22,6 +23,10 @@ namespace app {
 namespace {
 
 const char* kModes[] = {"fullscreen", "borderless", "windowed"};
+const char* kGpus[] = {"high_performance", "minimum_power", "unspecified"};
+// XC_LANGUAGE 1 to 9
+const char* kLanguages[] = {"english", "japanese", "german",  "french",    "spanish",
+                            "italian", "korean",   "chinese", "portuguese"};
 
 std::filesystem::path File() { return ExeDir() / kGame.settings; }
 
@@ -50,6 +55,12 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
+    s.rumble_percent = std::min<uint32_t>(t["rumble_percent"].value_or(s.rumble_percent), 200);
+    s.volume_percent = std::min<uint32_t>(t["volume_percent"].value_or(s.volume_percent), 100);
+    s.language = t["language"].value_or(s.language);
+    std::string gpu = t["gpu"].value_or(std::string(kGpus[uint32_t(s.gpu)]));
+    for (uint32_t i = 0; i < 3; i++)
+        if (gpu == kGpus[i]) s.gpu = GpuPreference(i);
     for (const Option& o : kGame.options) {
         if (o.flag) *o.flag = t[o.key].value_or(*o.flag);
         else *o.value = t[o.key].value_or(*o.value);
@@ -68,7 +79,11 @@ toml::table Table() {
                   {"fps_cap", int64_t(s.fps_cap)},
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
-                  {"join_ip", s.join_ip}};
+                  {"join_ip", s.join_ip},
+                  {"rumble_percent", int64_t(s.rumble_percent)},
+                  {"volume_percent", int64_t(s.volume_percent)},
+                  {"language", s.language},
+                  {"gpu", kGpus[uint32_t(s.gpu)]}};
     for (const Option& o : kGame.options) {
         if (o.flag) t.insert(o.key, *o.flag);
         else t.insert(o.key, int64_t(*o.value));
@@ -91,6 +106,12 @@ void LogSettings() {
     LOGR("Settings:");
     for (std::string line; std::getline(lines, line);)
         if (!line.empty()) LOGR("  %s", line.c_str());
+}
+
+uint32_t Language() {
+    for (uint32_t i = 0; i < std::size(kLanguages); i++)
+        if (Get().language == kLanguages[i]) return i + 1;
+    return 1;
 }
 
 Mode Desktop() {

@@ -401,9 +401,14 @@ uint16_t HeldOnAnyController() {
     return held;
 }
 
-// the speeds reach SDL unscaled; a scripted run ignores the physical controllers, and leaves their motors alone too
+// the speeds reach SDL scaled by the rumble_percent setting (100 leaves them as the title set them, more saturates at
+// full speed); a scripted run ignores the physical controllers, and leaves their motors alone too
 void Rumble(int port, uint16_t left, uint16_t right) {
     if (app::kGame.rumble) app::kGame.rumble(port, left, right);
+    uint32_t percent = app::Get().rumble_percent;
+    auto scale = [percent](uint16_t speed) { return uint16_t(std::min<uint32_t>(speed * percent / 100, 0xFFFF)); };
+    left = scale(left);
+    right = scale(right);
     std::lock_guard lock(g_lock);
     if (port < 0 || port >= 4) return;
     g_motors[port] = {left, right, SDL_GetTicks()};

@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 
+#include "app/app.h"
 #include "audio/audio.h"
 #include "core/log.h"
 
@@ -35,6 +36,11 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
         if (FAILED(hr)) {
             LOGE("audio: XAudio2 unavailable (%08X), no sound", unsigned(hr));
             return;
+        }
+        uint32_t volume = app::Get().volume_percent;
+        if (volume != 100) {
+            master->SetVolume(volume / 100.0f);
+            LOGR("audio: volume %u%%", volume);
         }
         voice->Start();
         constexpr uint32_t kFrames = kRate / 100;

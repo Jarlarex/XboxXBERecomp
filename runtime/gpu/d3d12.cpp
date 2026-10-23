@@ -880,11 +880,14 @@ bool D3D12Backend::CreateDevice() {
         if (SUCCEEDED(D3D12GetDebugInterface(IID_PPV_ARGS(&dbg)))) dbg->EnableDebugLayer();
     }
     if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory_)))) return false;
-    // dedicated GPU first on hybrid laptops
+    // the gpu setting: the dedicated GPU first on hybrid laptops by default, the integrated one, or the order Windows
+    // gives this executable (its per-app graphics preference)
+    static const DXGI_GPU_PREFERENCE kPreferences[] = {DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                       DXGI_GPU_PREFERENCE_MINIMUM_POWER, DXGI_GPU_PREFERENCE_UNSPECIFIED};
     ComPtr<IDXGIFactory6> f6;
     ComPtr<IDXGIAdapter1> adapter;
     if (SUCCEEDED(factory_.As(&f6))) {
-        f6->EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE, IID_PPV_ARGS(&adapter));
+        f6->EnumAdapterByGpuPreference(0, kPreferences[uint32_t(app::Get().gpu)], IID_PPV_ARGS(&adapter));
     }
     if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_))) &&
         FAILED(D3D12CreateDevice((adapter = nullptr).Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev_)))) {

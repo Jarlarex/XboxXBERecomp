@@ -15,6 +15,8 @@ struct Pad;
 namespace app {
 
 enum class DisplayMode : uint32_t { Fullscreen, Borderless, Windowed };
+// the adapter DXGI is asked for: the discrete GPU on a hybrid laptop, the integrated one, or Windows' per-app choice
+enum class GpuPreference : uint32_t { HighPerformance, MinimumPower, Unspecified };
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: just under the monitor's refresh rate
 
 struct Settings {
@@ -25,7 +27,15 @@ struct Settings {
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
+    uint32_t rumble_percent = 100;   // of the title's motor speeds, up to 200; past full speed it saturates
+    uint32_t volume_percent = 100;   // the whole output, up to 100
+    std::string language = "english";  // the dashboard language the title reads (Language)
+    GpuPreference gpu = GpuPreference::HighPerformance;
 };
+
+// the dashboard language as the console's XC_LANGUAGE has it, 1 english to 9 portuguese; english for a name it does
+// not know
+uint32_t Language();
 
 Settings& Get();
 void Load();
