@@ -33,6 +33,10 @@ struct Settings {
     bool hdr = false;
     uint32_t hdr_paper_white = 200;
     uint32_t hdr_peak = 400;
+    // the textures the title uploads, named by a hash: dumped as DDS files, and replaced from the player's pack
+    // (gpu/d3d12.cpp, core/texture_pack.h), under textures\dump and textures\replace in UserData()
+    bool texture_dump = false;
+    bool texture_pack = true;
     bool perf_overlay = false;       // the performance overlay at start; F2 toggles it
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     uint32_t rumble_percent = 100;   // of the title's motor speeds, up to 200; past full speed it saturates
@@ -68,6 +72,8 @@ double FrameAspect();
 bool Widescreen();
 
 std::filesystem::path ExeDir();
+// the player's own files besides the saves (texture dumps and packs): GameInfo::user_data, or the exe's folder
+std::filesystem::path UserData();
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image (.iso), which it mounts as D:; false after telling the player what is missing
 struct GameFiles {
@@ -127,6 +133,8 @@ struct GameInfo {
     // the game's hooks give the title any picture aspect FrameAspect reports (a widescreen title's camera and 2D
     // layouts), so aspect_ratio auto follows the window; without, a title draws the console's 16:9 or 4:3
     bool any_aspect = false;
+    // the folder of the player's own files besides the saves (UserData); null keeps them beside the exe
+    std::filesystem::path (*user_data)() = nullptr;
 };
 extern const GameInfo kGame;
 

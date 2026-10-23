@@ -8,6 +8,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
+#include <wincodec.h>
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -32,6 +33,7 @@
 #include "app/app.h"
 #include "core/diag.h"
 #include "core/log.h"
+#include "core/texture_pack.h"
 #include "gpu/backend.h"
 #include "gpu/ext.h"
 #include "gpu/overlay.h"
@@ -436,7 +438,72 @@ struct Tex {
     uint64_t frame = 0;
     uint64_t palette = 0;  // hash of the colours a P8 texture was decoded with
     uint8_t flags = 0;  // Extension::Decoded's
+    uint64_t hash = 0;      // texpack::Hash of what it was uploaded from, with dumps or a pack only
+    bool replaced = false;  // made from the pack's file for that hash, at its size and format
 };
+
+// texture dumps and packs (texture_dump, texture_pack): where they go, what was dumped, what the pack holds
+struct TexturePacks {
+    bool dump = false;
+    std::filesystem::path dump_dir;
+    std::unordered_map<uint64_t, std::filesystem::path> pack;
+    std::unordered_set<uint64_t> dumped, refused;
+    std::unordered_map<uint32_t, uint32_t> uploads;  // data address: uploads with new content, a moving texture's many
+    FILE* index = nullptr;
+    bool On() const { return dump || !pack.empty(); }
+};
+
+// a host format's DDS pixels, false for one not dumped (depth)
+bool DumpPixels(Host h, texpack::Pixels& out) {
+    switch (h) {
+        case Host::BGRA8: out = texpack::Pixels::Bgra8; return true;
+        case Host::BC1: out = texpack::Pixels::Bc1; return true;
+        case Host::BC2: out = texpack::Pixels::Bc2; return true;
+        case Host::BC3: out = texpack::Pixels::Bc3; return true;
+        default: return false;
+    }
+}
+
+DXGI_FORMAT PackFormat(texpack::Pixels p) {
+    switch (p) {
+        case texpack::Pixels::Bc1: return DXGI_FORMAT_BC1_UNORM;
+        case texpack::Pixels::Bc2: return DXGI_FORMAT_BC2_UNORM;
+        case texpack::Pixels::Bc3: return DXGI_FORMAT_BC3_UNORM;
+        case texpack::Pixels::Bc7: return DXGI_FORMAT_BC7_UNORM;
+        case texpack::Pixels::Bgra8: break;
+    }
+    return DXGI_FORMAT_B8G8R8A8_UNORM;
+}
+
+// a PNG through Windows' imaging component as BGRA, with mip levels; false with why
+bool ReadPng(const std::filesystem::path& file, texpack::Image& out, std::string& why) {
+    HRESULT co = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+    ComPtr<IWICImagingFactory> wic;
+    ComPtr<IWICBitmapDecoder> dec;
+    ComPtr<IWICBitmapFrameDecode> frame;
+    ComPtr<IWICBitmapSource> bgra;
+    UINT w = 0, h = 0;
+    bool ok = SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wic))) &&
+              SUCCEEDED(wic->CreateDecoderFromFilename(file.c_str(), nullptr, GENERIC_READ,
+                                                       WICDecodeMetadataCacheOnDemand, &dec)) &&
+              SUCCEEDED(dec->GetFrame(0, &frame)) &&
+              SUCCEEDED(WICConvertBitmapSource(GUID_WICPixelFormat32bppBGRA, frame.Get(), &bgra)) &&
+              SUCCEEDED(bgra->GetSize(&w, &h)) && w && h && w <= 16384 && h <= 16384;
+    if (ok) {
+        out = texpack::Image{};
+        out.width = w;
+        out.height = h;
+        out.data.resize(size_t(w) * h * 4);
+        ok = SUCCEEDED(bgra->CopyPixels(nullptr, w * 4, UINT(out.data.size()), out.data.data()));
+    }
+    if (SUCCEEDED(co)) CoUninitialize();
+    if (!ok) {
+        why = "Windows could not read it as an image";
+        return false;
+    }
+    texpack::MakeMips(out);
+    return true;
+}
 
 struct PsoKey {
     uint64_t vs;
@@ -648,8 +715,14 @@ private:
                                      DrawTextures& stages);
     bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t key);
     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours,
-                       bool same);
+                       bool same, texpack::Image* dump = nullptr);
     void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
+    // texture dumps and packs
+    void LoadTexturePacks();
+    bool UploadPacked(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, const uint32_t* colours,
+                      bool same, uint64_t key, uint64_t palette);
+    bool ReplaceTexture(Tex& tx, const TextureDesc& d, uint64_t hash);
+    void DumpTexture(const Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t hash, texpack::Image& img);
     void EnsurePixelShader(const PixelKey& pk, DrawShaders& sh);
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
     void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
@@ -828,6 +901,7 @@ private:
     std::unordered_map<uint64_t, Target> targets_;
     std::unordered_map<uint32_t, uint64_t> target_used_;  // target address to the frame it was last used
     std::unordered_map<uint64_t, Tex> textures_;  // by data address, a P8 texture's with its palette's above
+    TexturePacks packs_;
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> blit_psos_;
     Extension* ext_ = nullptr;
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
@@ -959,6 +1033,7 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     ImGui_ImplDX12_Init(dev_.Get(), kFrames, DXGI_FORMAT_B8G8R8A8_UNORM, ui_heap_.Get(),
                         ui_heap_->GetCPUDescriptorHandleForHeapStart(), ui_heap_->GetGPUDescriptorHandleForHeapStart());
     LoadSettings();
+    LoadTexturePacks();
     Begin();
     LOGR("d3d12: %ux%u guest, %ux%u window, picture %.3f wide, render scale %.3f (%ux%u), msaa %u", width, height, bb_w_,
          bb_h_, app::FrameAspect(), scale_, unsigned(std::lround(width * scale_)), unsigned(std::lround(height * scale_)),
@@ -2111,7 +2186,7 @@ void D3D12Backend::UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std
 }
 
 void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p,
-                                 const uint32_t* colours, bool same) {
+                                 const uint32_t* colours, bool same, texpack::Image* dump) {
     D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
     Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
     uint32_t faces = d.cube ? 6 : 1;
@@ -2122,6 +2197,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
             DecodeLevel(d, l, f, p, colours, px, pitch);
             if (ext_) ext_->Decoded(d, fi, f, l, px, pitch, tx.flags);
             UploadTextureLevel(tx, f, l, px, pitch);
+            if (dump) dump->data.insert(dump->data.end(), px.begin(), px.end());
         }
     }
     Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
@@ -2186,13 +2262,202 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(const State& s, int stage, const 
             g_perf.texups++;
             g_perf.texup_bytes += total;
             tx.sig = sig;
-            UploadTexture(tx, d, fi, p, palette.va ? palette.colours : nullptr, same);
+            const uint32_t* colours = palette.va ? palette.colours : nullptr;
+            if (!packs_.On()) {
+                UploadTexture(tx, d, fi, p, colours, same);
+            } else if (!UploadPacked(tx, d, fi, p, colours, same, key, palette.hash)) {
+                return nullptr;
+            }
         }
     }
     FillTextureView(tx, d, stages.sv[stage]);
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
     if (ext_) ext_->Sampled(d, nullptr, tx.flags, info);
     return tx.res.Get();
+}
+
+// UTF-8 for the log
+std::string Utf8(const std::filesystem::path& p) {
+    std::u8string u = p.u8string();
+    return std::string(u.begin(), u.end());
+}
+
+// the pack under the player's folder (textures\replace), indexed once; dumps to textures\dump with an index.txt
+void D3D12Backend::LoadTexturePacks() {
+    const app::Settings& s = app::Get();
+    std::filesystem::path root = app::UserData() / "textures";
+    std::error_code ec;
+    if (s.texture_pack) {
+        std::filesystem::path dir = root / "replace";
+        std::filesystem::create_directories(dir, ec);
+        size_t skipped = 0;
+        packs_.pack = texpack::IndexPack(dir, &skipped);
+        LOGR("textures: pack %s, %zu textures%s", Utf8(dir).c_str(), packs_.pack.size(),
+             skipped ? ", some files not named by a hash left out" : "");
+    }
+    if (s.texture_dump) {
+        packs_.dump = true;
+        packs_.dump_dir = root / "dump";
+        std::filesystem::create_directories(packs_.dump_dir, ec);
+        packs_.index = _wfopen((packs_.dump_dir / "index.txt").c_str(), L"a");
+        LOGR("textures: dumping to %s", Utf8(packs_.dump_dir).c_str());
+    }
+}
+
+// a texture's upload with dumps or a pack: hashed, made from the pack's file when it has one, else uploaded as always
+// and dumped once; false when a texture could not be made
+bool D3D12Backend::UploadPacked(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p,
+                                const uint32_t* colours, bool same, uint64_t key, uint64_t palette) {
+    constexpr uint32_t kMovingUploads = 4;   // uploads close together that make a texture a moving one, not dumped
+    constexpr uint64_t kMovingFrames = 30;   // what close together is
+    uint64_t hash = texpack::Hash(p, TotalSize(d), {d.format, d.width, d.height, d.depth, d.levels, d.cube, palette});
+    if (tx.replaced && hash != tx.hash) {
+        // the title changed a replaced texture: its own again, at the console's size
+        uint64_t sig = tx.sig, frame = tx.frame;
+        if (!CreateTexture(tx, d, fi, key)) return false;
+        tx.sig = sig;
+        tx.frame = frame;
+        tx.palette = palette;
+        same = false;
+    }
+    if (ReplaceTexture(tx, d, hash)) return true;
+    // a texture the title keeps changing (the glyph cache, a movie) is not dumped
+    struct Moving {
+        uint64_t frame = 0;
+        uint32_t count = 0;
+    };
+    static std::unordered_map<uint32_t, Moving> moving;
+    Moving& m = moving[d.data];
+    m.count = presents_ - m.frame < kMovingFrames ? m.count + 1 : 1;
+    m.frame = presents_;
+    texpack::Image img;
+    bool dump = packs_.dump && m.count <= kMovingUploads && !packs_.dumped.count(hash) && DumpPixels(fi.host, img.pixels);
+    UploadTexture(tx, d, fi, p, colours, same, dump ? &img : nullptr);
+    tx.hash = hash;
+    if (dump) DumpTexture(tx, d, fi, hash, img);
+    return true;
+}
+
+// the pack's file for the hash, made into tx at its own size, format and levels; false without one or when it cannot
+// be used (said once)
+bool D3D12Backend::ReplaceTexture(Tex& tx, const TextureDesc& d, uint64_t hash) {
+    auto it = packs_.pack.find(hash);
+    if (it == packs_.pack.end() || packs_.refused.count(hash)) return false;
+    if (tx.replaced && tx.hash == hash) return true;
+    const std::filesystem::path& file = it->second;
+    texpack::Image img;
+    std::string why;
+    std::string ext = file.extension().string();
+    std::transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char c) { return char(std::tolower(c)); });
+    bool ok;
+    if (ext == ".png") {
+        ok = ReadPng(file, img, why);
+    } else {
+        std::vector<uint8_t> bytes;
+        if (FILE* f = _wfopen(file.c_str(), L"rb")) {
+            std::fseek(f, 0, SEEK_END);
+            bytes.resize(size_t(std::max(0L, std::ftell(f))));
+            std::fseek(f, 0, SEEK_SET);
+            bytes.resize(std::fread(bytes.data(), 1, bytes.size(), f));
+            std::fclose(f);
+        }
+        ok = texpack::ReadDds(bytes, img, why);
+    }
+    if (ok && (img.cube != d.cube || (img.depth > 1) != (d.depth > 1))) {
+        ok = false;
+        why = d.cube ? "the game's texture is a cube map" : d.depth > 1 ? "the game's texture is a volume" : "the game's texture is 2D";
+    }
+    if (ok && texpack::BlockBytes(img.pixels) && ((img.width & 3) || (img.height & 3))) {
+        ok = false;
+        why = "a block-compressed size that is no multiple of 4";
+    }
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td{};
+    td.Dimension = img.depth > 1 ? D3D12_RESOURCE_DIMENSION_TEXTURE3D : D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    td.Width = img.width;
+    td.Height = img.height;
+    td.DepthOrArraySize = UINT16(img.cube ? 6 : img.depth);
+    td.MipLevels = UINT16(img.levels);
+    td.Format = PackFormat(img.pixels);
+    td.SampleDesc.Count = 1;
+    ComPtr<ID3D12Resource> res;
+    if (ok && FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST,
+                                                   nullptr, IID_PPV_ARGS(&res)))) {
+        ok = false;
+        why = "the GPU could not make it";
+    }
+    if (!ok) {
+        LOGW("textures: %s is not used: %s", Utf8(file).c_str(), why.c_str());
+        packs_.refused.insert(hash);
+        return false;
+    }
+    // each face's levels, as the DDS holds them
+    size_t at = 0;
+    for (uint32_t f = 0; f < (img.cube ? 6u : 1u); f++) {
+        for (uint32_t l = 0; l < img.levels; l++) {
+            uint32_t w = std::max(1u, img.width >> l), h = std::max(1u, img.height >> l);
+            uint32_t slices = std::max(1u, img.depth >> l), block = texpack::BlockBytes(img.pixels);
+            uint32_t pitch = block ? std::max(1u, (w + 3) / 4) * block : w * 4, rows = block ? std::max(1u, (h + 3) / 4) : h;
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+            UINT n_rows;
+            UINT64 row_size, bytes;
+            uint32_t sub = f * img.levels + l;
+            dev_->GetCopyableFootprints(&td, sub, 1, 0, &fp, &n_rows, &row_size, &bytes);
+            Alloc a = Upload(bytes, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+            for (uint32_t z = 0; z < slices; z++)
+                for (uint32_t y = 0; y < rows; y++)
+                    std::memcpy(a.cpu + (size_t(z) * n_rows + y) * fp.Footprint.RowPitch,
+                                &img.data[at + (size_t(z) * rows + y) * pitch], std::min<size_t>(pitch, size_t(row_size)));
+            at += size_t(pitch) * rows * slices;
+            fp.Offset = a.off;
+            D3D12_TEXTURE_COPY_LOCATION dl{res.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+            dl.SubresourceIndex = sub;
+            D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+            sl.PlacedFootprint = fp;
+            cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+        }
+    }
+    D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COPY_DEST;
+    Transition(res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (tx.res) CurrentFrame().garbage.push_back(tx.res);
+    tx.res = res;
+    tx.fmt = td.Format;
+    tx.levels = img.levels;
+    tx.replaced = true;
+    tx.hash = hash;
+    LOG_FIRST(64, "textures: %s replaces %ux%u %s at %08X (%ux%u, %u levels)", Utf8(file.filename()).c_str(), d.width,
+              d.height, Format(d.format).name, d.data, img.width, img.height, img.levels);
+    return true;
+}
+
+// a texture as uploaded, into the dump folder as <hash>.dds with a line in index.txt
+void D3D12Backend::DumpTexture(const Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint64_t hash,
+                               texpack::Image& img) {
+    packs_.dumped.insert(hash);
+    D3D12_RESOURCE_DESC rd = tx.res->GetDesc();
+    img.width = uint32_t(rd.Width);
+    img.height = rd.Height;
+    img.cube = d.cube;
+    img.depth = d.cube ? 1 : d.depth;
+    img.levels = tx.levels;
+    if (texpack::ImageBytes(img) != img.data.size()) {
+        LOG_FIRST(8, "textures: %016llX at %08X not dumped: %zu bytes decoded for %zu", (unsigned long long)hash, d.data,
+                  img.data.size(), texpack::ImageBytes(img));
+        return;
+    }
+    std::filesystem::path file = packs_.dump_dir / (texpack::Name(hash) + ".dds");
+    std::error_code ec;
+    if (std::filesystem::exists(file, ec)) return;
+    std::vector<uint8_t> bytes = texpack::WriteDds(img);
+    if (FILE* f = _wfopen(file.c_str(), L"wb")) {
+        std::fwrite(bytes.data(), 1, bytes.size(), f);
+        std::fclose(f);
+    }
+    if (packs_.index) {
+        std::fprintf(packs_.index, "%s %s %ux%ux%u levels %u%s\n", texpack::Name(hash).c_str(), fi.name, d.width,
+                     d.height, d.depth, d.levels, d.cube ? " cube" : d.depth > 1 ? " volume" : "");
+        std::fflush(packs_.index);
+    }
 }
 
 // textures_ entries of cube maps made from targets, apart from the guest textures keyed by palette and data
@@ -2748,6 +3013,9 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
             fprintf(cap_, " pal %08X %08X %08X %08X %08X", palette.va, palette.colours[0], palette.colours[1],
                     palette.colours[2], palette.colours[3]);
         }
+        // with dumps or a pack, the name a texture's file has (texture_pack)
+        if (auto tit = textures_.find(uint64_t(palette.va) << 32 | d.data); !tg && tit != textures_.end() && tit->second.hash)
+            fprintf(cap_, " hash %s%s", texpack::Name(tit->second.hash).c_str(), tit->second.replaced ? " replaced" : "");
         if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
         }

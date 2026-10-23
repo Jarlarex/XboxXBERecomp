@@ -117,6 +117,8 @@ void Load() {
     s.hdr = transfer.hdr;
     s.hdr_paper_white = uint32_t(transfer.paper_white);
     s.hdr_peak = uint32_t(transfer.peak);
+    s.texture_dump = t["texture_dump"].value_or(s.texture_dump);
+    s.texture_pack = t["texture_pack"].value_or(s.texture_pack);
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.rumble_percent = std::min<uint32_t>(t["rumble_percent"].value_or(s.rumble_percent), 200);
@@ -153,6 +155,8 @@ toml::table Table() {
                   {"hdr", s.hdr},
                   {"hdr_paper_white", int64_t(s.hdr_paper_white)},
                   {"hdr_peak", int64_t(s.hdr_peak)},
+                  {"texture_dump", s.texture_dump},
+                  {"texture_pack", s.texture_pack},
                   {"perf_overlay", s.perf_overlay},
                   {"join_ip", s.join_ip},
                   {"rumble_percent", int64_t(s.rumble_percent)},
@@ -186,6 +190,8 @@ void LogSettings() {
     for (std::string line; std::getline(lines, line);)
         if (!line.empty()) LOGR("  %s", line.c_str());
 }
+
+std::filesystem::path UserData() { return kGame.user_data ? kGame.user_data() : ExeDir(); }
 
 uint32_t Language() {
     for (uint32_t i = 0; i < std::size(kLanguages); i++)
