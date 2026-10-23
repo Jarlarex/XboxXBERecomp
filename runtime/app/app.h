@@ -27,6 +27,12 @@ struct Settings {
     bool vsync = true;
     uint32_t aniso = 0;              // 0 as the game asks
     uint32_t msaa = 1;               // samples a pixel of the title's frame buffers: 1, 2, 4 or 8
+    // the output transfer after the title's gamma ramp (display::Transfer): display_gamma 2.2 is the frame as drawn, 2.4
+    // a CRT television's; hdr scRGB with paper white and peak in nits, when Windows runs the monitor in HDR
+    double display_gamma = display::kPcGamma;
+    bool hdr = false;
+    uint32_t hdr_paper_white = 200;
+    uint32_t hdr_peak = 400;
     bool perf_overlay = false;       // the performance overlay at start; F2 toggles it
     std::string join_ip;                   // co-op: a host past the LAN the system link search also asks
     uint32_t rumble_percent = 100;   // of the title's motor speeds, up to 200; past full speed it saturates

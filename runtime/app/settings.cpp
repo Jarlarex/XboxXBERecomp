@@ -109,6 +109,14 @@ void Load() {
     s.vsync = t["vsync"].value_or(s.vsync);
     s.aniso = display::Anisotropy(t["anisotropic_filtering"].value_or(int64_t(s.aniso)));
     s.msaa = display::MsaaSamples(t["msaa"].value_or(int64_t(s.msaa)));
+    display::Transfer transfer{t["display_gamma"].value_or(s.display_gamma), t["hdr"].value_or(s.hdr),
+                               double(t["hdr_paper_white"].value_or(int64_t(s.hdr_paper_white))),
+                               double(t["hdr_peak"].value_or(int64_t(s.hdr_peak)))};
+    transfer = display::ClampTransfer(transfer);
+    s.display_gamma = transfer.gamma;
+    s.hdr = transfer.hdr;
+    s.hdr_paper_white = uint32_t(transfer.paper_white);
+    s.hdr_peak = uint32_t(transfer.peak);
     s.perf_overlay = t["perf_overlay"].value_or(s.perf_overlay);
     s.join_ip = t["join_ip"].value_or(s.join_ip);
     s.rumble_percent = std::min<uint32_t>(t["rumble_percent"].value_or(s.rumble_percent), 200);
@@ -141,6 +149,10 @@ toml::table Table() {
                   {"vsync", s.vsync},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", int64_t(s.msaa)},
+                  {"display_gamma", s.display_gamma},
+                  {"hdr", s.hdr},
+                  {"hdr_paper_white", int64_t(s.hdr_paper_white)},
+                  {"hdr_peak", int64_t(s.hdr_peak)},
                   {"perf_overlay", s.perf_overlay},
                   {"join_ip", s.join_ip},
                   {"rumble_percent", int64_t(s.rumble_percent)},

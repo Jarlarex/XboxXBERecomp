@@ -13,6 +13,7 @@
 #include <wrl/client.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -121,8 +122,29 @@ bool CaptureOn() {
     return !diag::CaptureDir().empty();
 }
 
+// The output transfer of the present pass (display::Transfer; the same maths, tested there): xfer.x 0 leaves colour as it
+// is, 1 raises it to xfer.y / 2.2 (a television's gamma on a PC display), 2 decodes it with gamma xfer.y to linear light,
+// at paper white xfer.z below the knee rising to the peak xfer.w at white, both in scRGB's 80 nits; xfer2.x set: the
+// colour is premultiplied by its alpha (the interface layer)
+#define XBE_TRANSFER_HLSL R"(
+float3 Transfer(float3 c) {
+    if (xfer.x == 1) return pow(saturate(c), xfer.y / 2.2);
+    if (xfer.x == 2) {
+        float3 x = pow(saturate(c), xfer.y);
+        float3 k = saturate((x - 0.6) / 0.4);
+        return x * xfer.z + (xfer.w - xfer.z) * k * k * (3 - 2 * k);
+    }
+    return c;
+}
+float4 TransferAlpha(float4 c) {
+    if (xfer2.x > 0) return c.a > 0 ? float4(Transfer(c.rgb / c.a) * c.a, c.a) : c;
+    return float4(Transfer(c.rgb), c.a);
+}
+)"
+
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 xfer; float4 xfer2; };
+)" XBE_TRANSFER_HLSL R"(
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 SamplerState ls : register(s0);
@@ -144,15 +166,17 @@ float4 psmain(O i) : SV_Target {
     c /= n * n;
     c.rgb *= opts.w;
     if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    c = TransferAlpha(c);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
 )";
 
 // A colour keyed overlay: drawn only where the frame under it holds the key, which the video scaler compared with the
 // frame buffer's pixels. uvrect maps the overlay surface, framerect the frame; key.rgb is the key in 0 to 255, opts.x
-// the gamma lookup, opts.y the frame's range.
+// the gamma lookup, opts.y the frame's range; xfer the output transfer.
 const char* kKeyedOverlayHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 framerect; float4 key; float4 opts; };
+cbuffer B : register(b1) { float4 uvrect; float4 framerect; float4 key; float4 opts; float4 xfer; float4 xfer2; };
+)" XBE_TRANSFER_HLSL R"(
 Texture2D img : register(t0);
 Texture2D frame : register(t1);
 Texture2D lut : register(t2);
@@ -172,7 +196,7 @@ float4 psmain(O i) : SV_Target {
     if (any(abs(f - key.rgb) > 0.5)) discard;
     float4 c = img.SampleLevel(ls, i.uv, 0);
     if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
-    return float4(c.rgb, 1);
+    return float4(Transfer(c.rgb), 1);
 }
 )";
 
@@ -456,6 +480,10 @@ struct BlitOptions {
     DXGI_FORMAT rtv = kBgra;  // the target's format
     bool over = false;        // premultiplied over the target, which keeps its alpha
     uint32_t samples = 1;     // the target's
+    // the output transfer (XBE_TRANSFER_HLSL's xfer: mode, gamma, paper white and peak in 80 nits), none by default;
+    // premultiplied: the source's colour is (the interface layer)
+    std::array<float, 4> xfer = {0, 2.2f, 1, 1};
+    bool premultiplied = false;
 };
 
 // Shrink's settings past the source and the size
@@ -678,10 +706,18 @@ private:
     void ResizeSwap();
     void UploadGammaRamp();
     void DrawFrame(Target* t, uint32_t bi);
-    void BlitFrame(Target& t);
-    void DrawOverlay(Target& frame);
+    void BlitFrame(Target& t, bool output = true);
+    void DrawOverlay(Target& frame, bool output = true);
     Tex* OverlayTexture();
-    void RenderUi();
+    void RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE back);
+    // the output transfer: what the swap chain is, and the present pass's xfer for the frame and for the interface
+    enum class Output : uint8_t { Sdr, Sdr10, Hdr };
+    void UpdateOutput();
+    bool SetOutput(Output want);
+    std::array<float, 4> OutputXfer() const;
+    std::array<float, 4> InterfaceXfer() const;
+    bool EnsureUiLayer();
+    void CapFloat(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, const char* name);
     void ReleaseOldTextures();
     void ResetFrame();
     void ReadTimestamps(Frame& f);
@@ -811,6 +847,12 @@ private:
     std::vector<CapTex> cap_tex_;
     bool cap_screen_ = false;  // the frame being presented ends a capture: save the swap chain's image too
     DXGI_FORMAT swap_fmt_ = kBgra;
+    Output output_ = Output::Sdr;
+    display::Transfer transfer_;
+    bool hdr_refused_ = false;  // the swap chain took no HDR output: not asked again until Windows' HDR state changes
+    // the interface drawn into an 8-bit layer of its own when the swap chain is not 8-bit SDR, composited at paper white
+    ComPtr<ID3D12Resource> ui_layer_;
+    D3D12_RESOURCE_STATES ui_layer_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
     ComPtr<ID3D12Resource> lut_;
     D3D12_RESOURCE_STATES lut_state_ = D3D12_RESOURCE_STATE_COPY_DEST;
     uint8_t ramp_[768] = {};
@@ -1016,7 +1058,7 @@ void D3D12Backend::CreateBackBufferViews() {
 void D3D12Backend::CreateHeaps() {
     srv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, kSrvCount, true, srv_heap_);
     smp_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER, kSamplerCount, true, smp_heap_);
-    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames, false, rtv_heap_);
+    rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + 1, false, rtv_heap_);
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
     CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
@@ -1693,8 +1735,10 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
-    float c[8] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
-                  o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul};
+    float c[16] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+                   o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul,
+                   o.xfer[0], o.xfer[1], o.xfer[2], o.xfer[3],
+                   o.premultiplied ? 1.0f : 0.0f, 0, 0, 0};
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
@@ -3354,7 +3398,7 @@ void D3D12Backend::ResizeSwap() {
         if (f.fence) WaitFence(f.fence);
     }
     for (auto& b : bb_) b.Reset();
-    swap_->ResizeBuffers(kFrames, w, h, DXGI_FORMAT_B8G8R8A8_UNORM, SwapFlags());
+    swap_->ResizeBuffers(kFrames, w, h, swap_fmt_, SwapFlags());
     CreateBackBufferViews();
     bb_w_ = w;
     bb_h_ = h;
@@ -3424,7 +3468,7 @@ void D3D12Backend::UploadGammaRamp() {
 
 // the frame into its rectangle in the window (FrameAspect): box-filtered when it is larger, a render scale over what
 // covers the rectangle being supersampling
-void D3D12Backend::BlitFrame(Target& t) {
+void D3D12Backend::BlitFrame(Target& t, bool output) {
     display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
     float uv[4] = {0, 0, 1, 1};
     D3D12_VIEWPORT vp{float(r.x), float(r.y), float(r.w), float(r.h), 0, 1};
@@ -3434,7 +3478,9 @@ void D3D12Backend::BlitFrame(Target& t) {
     ID3D12Resource* from = Readable(t, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     float over = std::max(float(t.w) / std::max(r.w, 1u), float(t.h) / std::max(r.h, 1u));
     uint32_t taps = uint32_t(std::ceil(std::max(over, 1.0f) - kTapsSlack));
-    Blit(from, t.fmt, uv, {.gamma = gamma_, .taps = taps});
+    BlitOptions o{.gamma = gamma_, .taps = taps, .rtv = output ? swap_fmt_ : kBgra};
+    if (output) o.xfer = OutputXfer();
+    Blit(from, t.fmt, uv, o);
 }
 
 void D3D12Backend::SetOverlay(const Overlay& overlay) {
@@ -3463,7 +3509,8 @@ Tex* D3D12Backend::OverlayTexture() {
     return &tx;
 }
 
-// the frame as the window shows it, the overlay over it and the interface left out, as window.bmp in a capture
+// the frame as the window shows it, the overlay over it and the interface left out, before the output transfer (a
+// television gamma, HDR), as window.bmp in a capture
 void D3D12Backend::CapWindow(const Surface& front) {
     Target* t = FindTarget(front, false);
     if (!t || free_rtv_.empty()) return;
@@ -3484,8 +3531,8 @@ void D3D12Backend::CapWindow(const Surface& front) {
     cl_->ClearRenderTargetView(rh, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &rh, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
-    BlitFrame(*t);
-    DrawOverlay(*t);
+    BlitFrame(*t, false);
+    DrawOverlay(*t, false);
     D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_RENDER_TARGET;
     CapSave({.res = img.Get(), .state = &st, .fmt = kBgra, .w = bb_w_, .h = bb_h_}, "window");
     CurrentFrame().garbage.push_back(img);
@@ -3493,7 +3540,7 @@ void D3D12Backend::CapWindow(const Surface& front) {
 
 // The overlay over the window's image, mapped as BlitFrame maps the frame. A colour keyed overlay shows only where
 // the frame holds the key.
-void D3D12Backend::DrawOverlay(Target& frame) {
+void D3D12Backend::DrawOverlay(Target& frame, bool output) {
     Tex* tx = OverlayTexture();
     if (!tx) return;
     const Overlay& o = overlay_;
@@ -3513,11 +3560,13 @@ void D3D12Backend::DrawOverlay(Target& frame) {
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
     float uv[4] = {src[0] / tw, src[1] / th, (src[2] - src[0]) / tw, (src[3] - src[1]) / th};
+    DXGI_FORMAT rtv = output ? swap_fmt_ : kBgra;
+    std::array<float, 4> xfer = output ? OutputXfer() : BlitOptions{}.xfer;
     if (!o.color_key) {
-        Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_});
+        Blit(tx->res.Get(), tx->fmt, uv, {.gamma = gamma_, .rtv = rtv, .xfer = xfer});
         return;
     }
-    ID3D12PipelineState* pso = EnsurePassPipeline(kKeyedOverlayHlsl, "psmain", kBgra, -1);
+    ID3D12PipelineState* pso = EnsurePassPipeline(kKeyedOverlayHlsl, "psmain", rtv, -1);
     if (!pso) return;
     uint32_t slot = AllocSrvSlots(3);
     ID3D12Resource* views[3] = {tx->res.Get(), Readable(frame, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE), lut_.Get()};
@@ -3531,16 +3580,21 @@ void D3D12Backend::DrawOverlay(Target& frame) {
         dev_->CreateShaderResourceView(views[i], &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     // the key is a pixel of the frame buffer, X8R8G8B8
-    float c[16] = {uv[0], uv[1], uv[2], uv[3],
+    float c[24] = {uv[0], uv[1], uv[2], uv[3],
                    dst[0] / gw, dst[1] / gh, (dst[2] - dst[0]) / gw, (dst[3] - dst[1]) / gh,
                    float(o.key >> 16 & 0xFF), float(o.key >> 8 & 0xFF), float(o.key & 0xFF), 0,
-                   gamma_ ? 1.0f : 0.0f, frame.range, 0, 0};
+                   gamma_ ? 1.0f : 0.0f, frame.range, 0, 0,
+                   xfer[0], xfer[1], xfer[2], xfer[3],
+                   0, 0, 0, 0};
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, c, sizeof c);
     DrawFullScreen(pso, cb.gpu, slot);
 }
 
-void D3D12Backend::RenderUi() {
+// ImGui, over the frame in back. The interface is 8-bit sRGB: straight over an 8-bit SDR frame, as it always was; over
+// any other output drawn into a layer of its own, premultiplied, and composited at paper white without the frame's
+// television gamma
+void D3D12Backend::RenderUi(D3D12_CPU_DESCRIPTOR_HANDLE back) {
     std::lock_guard lock(app::UiLock());
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
@@ -3548,9 +3602,116 @@ void D3D12Backend::RenderUi() {
     if (app::kGame.ui) app::kGame.ui(fps_);
     if (g_perf_overlay) overlay_stats_.Draw(OverlayState(), bb_h_);
     ImGui::Render();
+    ImDrawData* dd = ImGui::GetDrawData();
+    if (!dd || !dd->TotalVtxCount) return;
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
+    if (swap_fmt_ == kBgra || !EnsureUiLayer()) {
+        cl_->SetDescriptorHeaps(1, uh);
+        ImGui_ImplDX12_RenderDrawData(dd, cl_.Get());
+        return;
+    }
+    D3D12_CPU_DESCRIPTOR_HANDLE layer = Cpu(rtv_heap_.Get(), kRtvCount + kFrames, rtv_inc_);
+    Transition(ui_layer_.Get(), ui_layer_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    float clear[4] = {0, 0, 0, 0};
+    cl_->ClearRenderTargetView(layer, clear, 0, nullptr);
+    cl_->OMSetRenderTargets(1, &layer, FALSE, nullptr);
     cl_->SetDescriptorHeaps(1, uh);
-    ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
+    ImGui_ImplDX12_RenderDrawData(dd, cl_.Get());
+    ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
+    cl_->SetDescriptorHeaps(2, heaps);
+    cl_->SetGraphicsRootSignature(root_.Get());
+    Transition(ui_layer_.Get(), ui_layer_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    SetBlitTarget(back, bb_w_, bb_h_);
+    float uv[4] = {0, 0, 1, 1};
+    Blit(ui_layer_.Get(), kBgra, uv,
+         {.alpha = true, .rtv = swap_fmt_, .over = true, .xfer = InterfaceXfer(), .premultiplied = true});
+}
+
+// the interface layer at the window's size, its view after the back buffers'
+bool D3D12Backend::EnsureUiLayer() {
+    if (ui_layer_ && ui_layer_->GetDesc().Width == bb_w_ && ui_layer_->GetDesc().Height == bb_h_) return true;
+    if (ui_layer_) CurrentFrame().garbage.push_back(ui_layer_);
+    ui_layer_ = nullptr;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kBgra, bb_w_, bb_h_);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    D3D12_CLEAR_VALUE cv{};
+    cv.Format = kBgra;
+    ui_layer_state_ = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, ui_layer_state_, &cv,
+                                             IID_PPV_ARGS(&ui_layer_)))) {
+        return false;
+    }
+    dev_->CreateRenderTargetView(ui_layer_.Get(), nullptr, Cpu(rtv_heap_.Get(), kRtvCount + kFrames, rtv_inc_));
+    return true;
+}
+
+// the frame's: as drawn, a television's gamma on a PC display, or HDR (XBE_TRANSFER_HLSL)
+std::array<float, 4> D3D12Backend::OutputXfer() const {
+    float gamma = float(transfer_.gamma);
+    if (output_ == Output::Hdr)
+        return {2, gamma, float(transfer_.paper_white / display::kScRgbNits), float(transfer_.peak / display::kScRgbNits)};
+    if (std::fabs(transfer_.gamma - display::kPcGamma) > 1e-3) return {1, gamma, 1, 1};
+    return {0, gamma, 1, 1};
+}
+
+// the interface's: as drawn in SDR, at paper white in HDR
+std::array<float, 4> D3D12Backend::InterfaceXfer() const {
+    if (output_ != Output::Hdr) return {0, float(display::kPcGamma), 1, 1};
+    float white = float(transfer_.paper_white / display::kScRgbNits);
+    return {2, float(display::kPcGamma), white, white};
+}
+
+// The swap chain for the settings and Windows' HDR state: 8-bit SDR as drawn (as always), 10-bit SDR when the frame
+// takes a television's gamma (the darkest steps stay apart), 16-bit float scRGB when hdr is on and Windows runs the
+// window's monitor in HDR (XBE_HDR_FORCE=1: on any monitor, for tests)
+void D3D12Backend::UpdateOutput() {
+    static const bool forced = GetEnvironmentVariableW(L"XBE_HDR_FORCE", nullptr, 0) > 0;
+    const app::Settings& s = app::Get();
+    transfer_ = display::ClampTransfer({s.display_gamma, s.hdr, double(s.hdr_paper_white), double(s.hdr_peak)});
+    bool tv = std::fabs(transfer_.gamma - display::kPcGamma) > 1e-3;
+    bool hdr = transfer_.hdr && (hdr_ > 0 || forced) && !hdr_refused_;
+    Output want = hdr ? Output::Hdr : tv ? Output::Sdr10 : Output::Sdr;
+    if (want == output_ || SetOutput(want)) return;
+    if (want == Output::Hdr) {
+        hdr_refused_ = true;
+        if (tv && output_ != Output::Sdr10) SetOutput(Output::Sdr10);
+    }
+}
+
+bool D3D12Backend::SetOutput(Output want) {
+    static const char* kNames[] = {"SDR, 8-bit", "SDR, 10-bit", "HDR, scRGB"};
+    DXGI_FORMAT fmt = want == Output::Hdr     ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                      : want == Output::Sdr10 ? DXGI_FORMAT_R10G10B10A2_UNORM
+                                              : kBgra;
+    DXGI_COLOR_SPACE_TYPE cs =
+        want == Output::Hdr ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709 : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+    Flush();
+    for (auto& f : frames_) {
+        if (f.fence) WaitFence(f.fence);
+    }
+    auto resize = [&](DXGI_FORMAT f) {
+        for (auto& b : bb_) b.Reset();
+        bool ok = SUCCEEDED(swap_->ResizeBuffers(kFrames, bb_w_, bb_h_, f, SwapFlags()));
+        CreateBackBufferViews();
+        return ok;
+    };
+    UINT support = 0;
+    if (!resize(fmt) || FAILED(swap_->CheckColorSpaceSupport(cs, &support)) ||
+        !(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT) || FAILED(swap_->SetColorSpace1(cs))) {
+        LOGW("d3d12: the swap chain takes no %s output here, it stays %s", kNames[uint32_t(want)],
+             kNames[uint32_t(output_)]);
+        resize(swap_fmt_);
+        return false;
+    }
+    swap_fmt_ = fmt;
+    output_ = want;
+    if (want == Output::Hdr)
+        LOGR("d3d12: output %s, paper white %.0f nits, peak %.0f nits, gamma %.1f", kNames[uint32_t(want)],
+             transfer_.paper_white, transfer_.peak, transfer_.gamma);
+    else
+        LOGR("d3d12: output %s, gamma %.1f", kNames[uint32_t(want)], transfer_.gamma);
+    return true;
 }
 
 void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
@@ -3563,14 +3724,23 @@ void D3D12Backend::DrawFrame(Target* t, uint32_t bi) {
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t);
     if (t) DrawOverlay(*t);
-    RenderUi();
+    RenderUi(rh);
     if (cap_screen_) {
-        // the captured frame as the swap chain shows it, the interface included, as screen.bmp
+        // the captured frame as the swap chain shows it, the interface included, as screen.bmp; an HDR one also as
+        // floats, screen.pfm, which tools/check-hdr-capture.py compares with window.bmp through the transfer
         cap_screen_ = false;
         ID3D12DescriptorHeap* heaps[] = {srv_heap_.Get(), smp_heap_.Get()};
         cl_->SetDescriptorHeaps(2, heaps);
         cl_->SetGraphicsRootSignature(root_.Get());
         CapSave({.res = bb_[bi].Get(), .state = &bs, .fmt = swap_fmt_, .w = bb_w_, .h = bb_h_}, "screen");
+        if (output_ == Output::Hdr) CapFloat(bb_[bi].Get(), bs, "screen");
+        if (FILE* f = _wfopen((cap_dir_ / "output.txt").c_str(), L"w")) {
+            std::array<float, 4> x = OutputXfer();
+            display::Rect r = display::FrameRect(app::FrameAspect(), bb_w_, bb_h_);
+            fprintf(f, "swap chain format %u\nxfer %g %g %g %g\npicture %u %u %u %u\n", unsigned(swap_fmt_), x[0], x[1],
+                    x[2], x[3], r.x, r.y, r.w, r.h);
+            fclose(f);
+        }
     }
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
 }
@@ -3708,6 +3878,9 @@ void D3D12Backend::Present(const Surface& front) {
 
 // returns the frame slot it presented
 D3D12Backend::Frame& D3D12Backend::PresentFrame(const Surface& front) {
+    // the ramp set for this frame shows it, in a capture's window image too
+    if (ramp_dirty_) UploadGammaRamp();
+    Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     if (cap_) {
         FinishCapture(front);
     } else if ((g_capture.exchange(false) || AutoCaptureDue()) && CaptureOn()) {
@@ -3717,8 +3890,19 @@ D3D12Backend::Frame& D3D12Backend::PresentFrame(const Surface& front) {
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
     if (t) Resolve(*t);
-    if (ramp_dirty_) UploadGammaRamp();
-    Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (presents_ % 300 == 0) {
+        HWND hwnd = static_cast<HWND>(app::Window());
+        int hdr = MonitorHdr(hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr);
+        if (hdr != hdr_) {
+            LOGR("d3d12: Windows HDR is %s on the window's monitor%s", hdr < 0 ? "unknown" : hdr ? "on" : "off",
+                 hdr > 0 && !app::Get().hdr ? ": with hdr off the SDR frame goes through Windows' SDR mapping, which "
+                                              "lifts dark tones"
+                                            : "");
+            hdr_refused_ = false;
+        }
+        hdr_ = hdr;
+    }
+    UpdateOutput();
 
     if (latency_wait_ && app::Get().vsync) {
         PerfScope perf_vsync{g_perf.vsync};
@@ -3753,14 +3937,6 @@ D3D12Backend::Frame& D3D12Backend::PresentFrame(const Surface& front) {
             LOGI("d3d12: %u display refresh%s a frame (display %u Hz, cap %u fps)", n, n == 1 ? "" : "es",
                  unsigned(dm.dmDisplayFrequency), cap);
         sync_interval_ = n;
-    }
-    if (presents_ % 300 == 0) {
-        HWND hwnd = static_cast<HWND>(app::Window());
-        int hdr = MonitorHdr(hwnd ? MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) : nullptr);
-        if (hdr != hdr_)
-            LOGI("d3d12: Windows HDR is %s on the window's monitor%s", hdr < 0 ? "unknown" : hdr ? "on" : "off",
-                 hdr > 0 ? ": the SDR frame is shown through Windows' SDR mapping, which lifts dark tones" : "");
-        hdr_ = hdr;
     }
     auto perf_swap = PerfClock::now();
     swap_->Present(vsync ? sync_interval_ : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);
@@ -4153,6 +4329,70 @@ constexpr int kBmpPlanes = 26;
 constexpr int kBmpBitCount = 28;
 constexpr int kBmpImageSize = 34;
 constexpr uint32_t kBmpInfoBytes = 40;
+
+// IEEE half to float
+float HalfToFloat(uint16_t h) {
+    uint32_t sign = uint32_t(h & 0x8000) << 16, exp = (h >> 10) & 0x1F, mant = h & 0x3FF, bits;
+    if (exp == 0) {
+        if (!mant) {
+            bits = sign;
+        } else {  // subnormal: normalise
+            exp = 127 - 15 + 1;
+            while (!(mant & 0x400)) {
+                mant <<= 1;
+                exp--;
+            }
+            bits = sign | exp << 23 | (mant & 0x3FF) << 13;
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000 | mant << 13;
+    } else {
+        bits = sign | (exp + 127 - 15) << 23 | mant << 13;
+    }
+    float f;
+    std::memcpy(&f, &bits, 4);
+    return f;
+}
+
+// a 16-bit float RGBA resource (the HDR swap chain) as a PFM of its RGB, bottom row first as the format has it
+void D3D12Backend::CapFloat(ID3D12Resource* res, D3D12_RESOURCE_STATES& state, const char* name) {
+    D3D12_RESOURCE_DESC rd = res->GetDesc();
+    if (rd.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp;
+    UINT rows;
+    UINT64 row_size;
+    UINT64 bytes;
+    dev_->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &row_size, &bytes);
+    ComPtr<ID3D12Resource> rb;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_READBACK};
+    D3D12_RESOURCE_DESC bd = BufferDesc(bytes);
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                             IID_PPV_ARGS(&rb)))) {
+        return;
+    }
+    Transition(res, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    D3D12_TEXTURE_COPY_LOCATION dl{rb.Get(), D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
+    dl.PlacedFootprint = fp;
+    D3D12_TEXTURE_COPY_LOCATION sl{res, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
+    cl_->CopyTextureRegion(&dl, 0, 0, 0, &sl, nullptr);
+    Flush();
+    const uint8_t* p = nullptr;
+    if (FAILED(rb->Map(0, nullptr, reinterpret_cast<void**>(const_cast<uint8_t**>(&p))))) return;
+    uint32_t w = uint32_t(rd.Width), h = rd.Height;
+    std::vector<float> px(size_t(w) * h * 3);
+    for (uint32_t y = 0; y < h; y++) {
+        const uint16_t* row = reinterpret_cast<const uint16_t*>(p + size_t(y) * fp.Footprint.RowPitch);
+        float* out = &px[size_t(h - 1 - y) * w * 3];
+        for (uint32_t x = 0; x < w; x++)
+            for (int c = 0; c < 3; c++) out[x * 3 + c] = HalfToFloat(row[x * 4 + c]);
+    }
+    rb->Unmap(0, nullptr);
+    if (FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".pfm")).c_str(), L"wb")) {
+        fprintf(f, "PF\n%u %u\n-1.0\n", w, h);
+        fwrite(px.data(), sizeof(float), px.size(), f);
+        fclose(f);
+    }
+}
 
 void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
